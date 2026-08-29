@@ -1,0 +1,3 @@
+[submodule "ANLP/project"]
+	path = ANLP/project
+	url = git@github.com:abhirajratna/ANLP-Project.git
