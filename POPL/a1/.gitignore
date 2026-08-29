@@ -1,0 +1,27 @@
+.DS_Store
+compiled/
+/doc/
+*~
+*.bak
+\#*
+.\#*
+tests/*
+*.swp
+
+# holds TEST_KEY, the grading archive passphrase
+.env
+
+# Lean
+# lean/lake-manifest.json is committed: it pins the (empty) dependency set and
+# lean-action reads it to build its cache key.
+.lake/
+lean/results.json
+
+# grading leftovers, in case a run is interrupted before it can clean up
+racket/main.rkt.orig
+lean/Tests.lean
+lean/Guard.lean
+lean/results-*.json
+lean/guard.txt
+lean/guard.log
+lean/lakefile.toml.orig
