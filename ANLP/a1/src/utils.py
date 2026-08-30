@@ -1,243 +1,238 @@
-"""Evaluation metrics, greedy decoding, and training utilities."""
+"""Evaluation metrics (bit accuracy, sequence accuracy, Levenshtein, BLEU,
+ROUGE-L) and plotting helpers.  All metrics are implemented from scratch.
+"""
 
-from collections import Counter
 import math
-import random
-from typing import Dict, List, Optional, Union
+from collections import Counter
+from typing import List
+
 import numpy as np
-import torch
 
 
-def set_seed(seed: int = 42) -> None:
-    """Set seeds for reproducibility across random, numpy, and torch."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+# --- string / bit helpers -------------------------------------------------------
+def _bytes_of(text: str) -> bytes:
+    return text.encode("utf-8")
 
 
-def causal_mask(length: int, device: Optional[torch.device] = None) -> torch.Tensor:
-    """Return a lower-triangular boolean causal mask of shape [length, length].
+def _bits_of(text: str) -> np.ndarray:
+    b = _bytes_of(text)
+    if len(b) == 0:
+        return np.zeros(0, dtype=np.uint8)
+    return np.unpackbits(np.frombuffer(b, dtype=np.uint8))
 
-    True indicates allowed attention positions, False indicates future masked positions.
+
+# --- sequence accuracy -----------------------------------------------------------
+def sequence_accuracy(preds: List[str], refs: List[str]) -> float:
+    if not preds:
+        return 0.0
+    return float(np.mean([1.0 if p == r else 0.0 for p, r in zip(preds, refs)]))
+
+
+# --- bit-level accuracy -----------------------------------------------------------
+def bit_accuracy(preds: List[str], refs: List[str]) -> float:
+    """Fraction of matching bits, aligned to the reference length.
+
+    Predictions shorter than the reference are zero-padded; longer ones are
+    truncated, so every reference bit contributes exactly one comparison.
     """
-    return torch.tril(torch.ones(length, length, dtype=torch.bool, device=device))
-
-
-def text_to_bits(text: str) -> str:
-    """Convert text string into UTF-8 binary bitstring ('0' and '1')."""
-    return "".join(f"{b:08b}" for b in text.encode("utf-8", errors="replace"))
-
-
-def bit_level_accuracy(predictions: List[str], targets: List[str]) -> float:
-    """Compute the percentage of exact bit matches between prediction and target."""
-    if not targets:
-        return 0.0
-
-    total_acc = 0.0
-    for pred, tgt in zip(predictions, targets):
-        pred_bits = text_to_bits(pred)
-        tgt_bits = text_to_bits(tgt)
-
-        max_len = max(len(pred_bits), len(tgt_bits))
-        if max_len == 0:
-            total_acc += 1.0
+    correct = total = 0
+    for p, r in zip(preds, refs):
+        rb = _bits_of(r)
+        pb = _bits_of(p)
+        n = len(rb)
+        if n == 0:
             continue
-
-        # Pad shorter bitstring with zeros for comparison
-        pred_padded = pred_bits.ljust(max_len, "0")
-        tgt_padded = tgt_bits.ljust(max_len, "0")
-
-        matches = sum(p == t for p, t in zip(pred_padded, tgt_padded))
-        total_acc += matches / max_len
-
-    return total_acc / len(targets)
+        if len(pb) < n:
+            pb = np.concatenate([pb, np.zeros(n - len(pb), dtype=np.uint8)])
+        correct += int((pb[:n] == rb).sum())
+        total += n
+    return correct / total if total else 0.0
 
 
-def sequence_accuracy(predictions: List[str], targets: List[str]) -> float:
-    """Compute the percentage of sequences that are perfectly reconstructed (100% exact match)."""
-    if not targets:
+# --- Levenshtein -------------------------------------------------------------------
+def _levenshtein_naive(a: str, b: str) -> int:
+    """Reference O(mn) DP (used to validate the vectorized version)."""
+    dp = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        new = [i] + [0] * len(b)
+        for j, cb in enumerate(b, start=1):
+            new[j] = min(dp[j] + 1, new[j - 1] + 1, dp[j - 1] + (ca != cb))
+        dp = new
+    return dp[-1]
+
+
+def levenshtein(a: str, b: str) -> int:
+    """Classic edit distance (insert/delete/substitute), O(len(a)*len(b)).
+
+    Vectorized row recurrence.  For a row with `prev` fixed, define
+    ``a[j] = min(prev[j]+1, prev[j-1]+cost[j])``; then
+    ``cur[j] = min(a[j], a[j-1]+1, a[j-2]+2, ...)`` =
+    ``min(a[j], j + min_{i<j}(a[i]-i))``, and the inner term is a prefix
+    minimum (``np.minimum.accumulate``) - no Python inner loop.
+    """
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    if len(b) > len(a):
+        a, b = b, a
+    n = len(b)
+    cb = np.array([ord(c) for c in b], dtype=np.int32)
+    j_idx = np.arange(1, n + 1, dtype=np.int32)
+    prev = np.arange(n + 1, dtype=np.int32)
+    INF = np.iinfo(np.int32).max // 4
+    for c in (ord(ch) for ch in a):
+        cost = (c != cb)  # (n,) bool
+        a_col = np.minimum(prev[1:] + 1, prev[:-1] + cost)  # delete / substitute
+        g = a_col - j_idx
+        prefix_min = np.minimum.accumulate(g)  # m[j] = min_{i<=j} g[i]
+        shifted = np.empty(n, dtype=np.int32)
+        shifted[0] = INF
+        shifted[1:] = prefix_min[:-1]
+        cur = np.empty(n + 1, dtype=np.int32)
+        cur[0] = prev[0] + 1
+        cur[1:] = np.minimum(a_col, j_idx + shifted)  # insert scan folded in
+        prev = cur
+    return int(prev[-1])
+
+
+def mean_levenshtein(preds: List[str], refs: List[str]) -> float:
+    if not preds:
         return 0.0
-    return sum(1.0 for p, t in zip(predictions, targets) if p == t) / len(targets)
+    return float(np.mean([levenshtein(p, r) for p, r in zip(preds, refs)]))
 
 
-def levenshtein_distance(prediction: str, target: str) -> int:
-    """Compute minimum edit distance between prediction and target strings."""
-    m, n = len(prediction), len(target)
-    dp = list(range(n + 1))
-
-    for i in range(1, m + 1):
-        prev = dp[0]
-        dp[0] = i
-        for j in range(1, n + 1):
-            temp = dp[j]
-            if prediction[i - 1] == target[j - 1]:
-                dp[j] = prev
-            else:
-                dp[j] = min(dp[j] + 1, dp[j - 1] + 1, prev + 1)
-            prev = temp
-
-    return dp[n]
+# --- BLEU (corpus-level, character n-grams) -------------------------------------------
+def _ngrams(s: str, n: int) -> List[str]:
+    if len(s) < n:
+        return []
+    return [s[i : i + n] for i in range(len(s) - n + 1)]
 
 
-def compute_bleu(predictions: List[str], targets: List[str], max_order: int = 4) -> float:
-    """Compute corpus BLEU score (BLEU-4) from scratch with brevity penalty."""
-    if not targets:
+def corpus_bleu(refs: List[str], hyps: List[str], max_n: int = 4) -> float:
+    """Standard corpus BLEU with brevity penalty (character n-grams)."""
+    if not refs:
         return 0.0
+    precisions = []
+    for n in range(1, max_n + 1):
+        num = den = 0
+        for r, h in zip(refs, hyps):
+            ref_counts = Counter(_ngrams(r, n))
+            hyp_counts = Counter(_ngrams(h, n))
+            num += sum(min(c, ref_counts[g]) for g, c in hyp_counts.items())
+            den += sum(hyp_counts.values())
+        if den == 0 or num == 0:
+            return 0.0
+        precisions.append(math.log(num / den))
+    log_avg = sum(precisions) / len(precisions)
+    len_ref = sum(len(r) for r in refs)
+    len_hyp = sum(len(h) for h in hyps)
+    bp = 1.0 if len_hyp > len_ref else math.exp(1 - len_ref / len_hyp) if len_hyp else 0.0
+    return math.exp(min(0.0, log_avg)) * bp if precisions else 0.0
 
-    p_ns = [0.0] * max_order
-    total_clipped = [0] * max_order
-    total_candidates = [0] * max_order
-    total_cand_len = 0
-    total_ref_len = 0
 
-    for pred, tgt in zip(predictions, targets):
-        cand_tokens = pred.strip().split()
-        ref_tokens = tgt.strip().split()
+# --- ROUGE-L (sentence-level F1, averaged) ------------------------------------------------
+def _lcs_len(a: str, b: str) -> int:
+    """LCS length, vectorized: cur[j] = max(a'[j], max_{i<j} cur[i]) where
+    a'[j] = max(prev[j], prev[j-1]+match[j]); the max-prefix is a running
+    maximum, so each row is a single np.maximum.accumulate."""
+    if not a or not b:
+        return 0
+    if len(b) > len(a):
+        a, b = b, a
+    cb = np.array([ord(c) for c in b], dtype=np.int32)
+    prev = np.zeros(len(b) + 1, dtype=np.int32)
+    for c in (ord(ch) for ch in a):
+        match = (c == cb)
+        cur = np.empty(len(b) + 1, dtype=np.int32)
+        cur[0] = 0
+        cur[1:] = np.maximum.accumulate(
+            np.maximum(prev[1:], prev[:-1] + match)
+        )
+        prev = cur
+    return int(prev[-1])
 
-        total_cand_len += len(cand_tokens)
-        total_ref_len += len(ref_tokens)
 
-        for n in range(1, max_order + 1):
-            cand_ngrams = Counter(
-                [tuple(cand_tokens[i : i + n]) for i in range(len(cand_tokens) - n + 1)]
-            )
-            ref_ngrams = Counter(
-                [tuple(ref_tokens[i : i + n]) for i in range(len(ref_tokens) - n + 1)]
-            )
-
-            clipped = sum(min(count, ref_ngrams[ngram]) for ngram, count in cand_ngrams.items())
-            total_clipped[n - 1] += clipped
-            total_candidates[n - 1] += max(0, len(cand_tokens) - n + 1)
-
-    for n in range(max_order):
-        if total_candidates[n] > 0:
-            p_ns[n] = max(1e-8, total_clipped[n] / total_candidates[n])
-        else:
-            p_ns[n] = 1e-8
-
-    # Brevity penalty
-    if total_cand_len == 0:
+def rouge_l_f1(ref: str, hyp: str) -> float:
+    l = _lcs_len(ref, hyp)
+    if l == 0:
         return 0.0
-    if total_cand_len > total_ref_len:
-        bp = 1.0
-    else:
-        bp = math.exp(1 - total_ref_len / total_cand_len)
-
-    # Geometric mean of modified n-gram precisions
-    log_p_sum = sum(math.log(p) for p in p_ns) / max_order
-    return bp * math.exp(log_p_sum)
+    p = l / len(hyp) if hyp else 0.0
+    r = l / len(ref) if ref else 0.0
+    return 2 * p * r / (p + r) if (p + r) else 0.0
 
 
-def compute_rouge(predictions: List[str], targets: List[str]) -> float:
-    """Compute average ROUGE-L (Longest Common Subsequence) F1 score."""
-    if not targets:
+def mean_rouge_l(refs: List[str], hyps: List[str]) -> float:
+    if not refs:
         return 0.0
-
-    f1_scores = []
-    for pred, tgt in zip(predictions, targets):
-        cand_tokens = pred.strip().split()
-        ref_tokens = tgt.strip().split()
-
-        m, n = len(cand_tokens), len(ref_tokens)
-        if m == 0 or n == 0:
-            f1_scores.append(1.0 if m == n else 0.0)
-            continue
-
-        # LCS length using DP
-        dp = [[0] * (n + 1) for _ in range(m + 1)]
-        for i in range(1, m + 1):
-            for j in range(1, n + 1):
-                if cand_tokens[i - 1] == ref_tokens[j - 1]:
-                    dp[i][j] = dp[i - 1][j - 1] + 1
-                else:
-                    dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
-
-        lcs_len = dp[m][n]
-        prec = lcs_len / m
-        rec = lcs_len / n
-
-        if prec + rec > 0:
-            f1 = (2 * prec * rec) / (prec + rec)
-        else:
-            f1 = 0.0
-        f1_scores.append(f1)
-
-    return sum(f1_scores) / len(f1_scores)
+    return float(np.mean([rouge_l_f1(r, h) for r, h in zip(refs, hyps)]))
 
 
-def compute_metrics(
-    predictions: List[str], targets: List[str], tokenized: bool = True
-) -> Dict[str, float]:
-    """Compute all evaluation metrics specified in the assignment."""
-    if not predictions or not targets:
-        return {
-            "bit_accuracy": 0.0,
-            "sequence_accuracy": 0.0,
-            "levenshtein": 0.0,
-            "bleu": 0.0 if tokenized else None,
-            "rouge": 0.0 if tokenized else None,
-        }
-
-    distances = [levenshtein_distance(p, t) for p, t in zip(predictions, targets)]
-    metrics = {
-        "bit_accuracy": bit_level_accuracy(predictions, targets),
-        "sequence_accuracy": sequence_accuracy(predictions, targets),
-        "levenshtein": sum(distances) / max(1, len(distances)),
+# --- aggregate ---------------------------------------------------------------------------
+def compute_metrics(refs: List[str], hyps: List[str], tokenized: bool = True) -> dict:
+    m = {
+        "bit_accuracy": bit_accuracy(hyps, refs),
+        "sequence_accuracy": sequence_accuracy(hyps, refs),
+        "levenshtein": mean_levenshtein(hyps, refs),
     }
-
     if tokenized:
-        metrics["bleu"] = compute_bleu(predictions, targets)
-        metrics["rouge"] = compute_rouge(predictions, targets)
+        # BLEU / ROUGE are reported for the tokenized configs (C1-C4).
+        m["bleu"] = corpus_bleu(refs, hyps)
+        m["rouge_l"] = mean_rouge_l(refs, hyps)
+    return m
+
+
+# --- plotting ------------------------------------------------------------------------------
+def plot_training_curves(history: dict, save_path: str) -> None:
+    """history: {"epoch": [...], "train_loss": [...], "val_loss": [...], "val_bit_accuracy": [...],
+    "val_sequence_accuracy": [...], "val_levenshtein": [...], "val_bleu": [...],
+    "val_rouge_l": [...], "train_samples_per_sec": [...], "peak_mem_mb": [...]}
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[utils] matplotlib not installed; skipping plot")
+        return
+
+    ep = history["epoch"]
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8))
+    fig.suptitle("Training curves", fontsize=14)
+
+    axes[0, 0].plot(ep, history["train_loss"], label="train")
+    axes[0, 0].plot(ep, history["val_loss"], label="val")
+    axes[0, 0].set_title("Cross-entropy loss")
+    axes[0, 0].set_xlabel("epoch"); axes[0, 0].legend(); axes[0, 0].grid(alpha=0.3)
+
+    axes[0, 1].plot(ep, history["val_bit_accuracy"], marker="o")
+    axes[0, 1].set_title("Val bit accuracy"); axes[0, 1].set_xlabel("epoch")
+    axes[0, 1].grid(alpha=0.3)
+
+    axes[0, 2].plot(ep, history["val_sequence_accuracy"], marker="o")
+    axes[0, 2].set_title("Val sequence accuracy"); axes[0, 2].set_xlabel("epoch")
+    axes[0, 2].grid(alpha=0.3)
+
+    axes[1, 0].plot(ep, history["val_levenshtein"], marker="o")
+    axes[1, 0].set_title("Val mean Levenshtein"); axes[1, 0].set_xlabel("epoch")
+    axes[1, 0].grid(alpha=0.3)
+
+    if "val_bleu" in history and history["val_bleu"] and history["val_bleu"][0] is not None:
+        axes[1, 1].plot(ep, [v if v is not None else 0 for v in history["val_bleu"]], marker="o", label="BLEU")
+        axes[1, 1].plot(ep, [v if v is not None else 0 for v in history["val_rouge_l"]], marker="s", label="ROUGE-L")
+        axes[1, 1].legend()
+    axes[1, 1].set_title("Val BLEU / ROUGE-L"); axes[1, 1].set_xlabel("epoch"); axes[1, 1].grid(alpha=0.3)
+
+    if "peak_mem_mb" in history and history["peak_mem_mb"]:
+        axes[1, 2].plot(ep, history["peak_mem_mb"], marker="o", color="green")
+        axes[1, 2].set_title("Peak GPU memory (MB)"); axes[1, 2].set_xlabel("epoch")
+        axes[1, 2].grid(alpha=0.3)
     else:
-        metrics["bleu"] = None
-        metrics["rouge"] = None
+        axes[1, 2].axis("off")
 
-    return metrics
-
-
-@torch.no_grad()
-def greedy_decode(
-    model: torch.nn.Module,
-    source: torch.Tensor,
-    tokenizer: object,
-    max_len: int = 512,
-    source_mask: Optional[torch.Tensor] = None,
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    """Autoregressive greedy decoding for sequence generation."""
-    model.eval()
-    if device is None:
-        device = source.device
-
-    source = source.to(device)
-    if source_mask is not None:
-        source_mask = source_mask.to(device)
-
-    bos_id = getattr(tokenizer, "bos_id", 1)
-    eos_id = getattr(tokenizer, "eos_id", 2)
-    b = source.size(0)
-
-    # Encode source sequence
-    memory = model.encode(source, src_mask=source_mask)
-
-    generated = torch.full((b, 1), bos_id, dtype=torch.long, device=device)
-    finished = torch.zeros(b, dtype=torch.bool, device=device)
-
-    for _ in range(max_len - 1):
-        tgt_mask = causal_mask(generated.size(1), device=device)
-        logits = model.decode(generated, memory, tgt_mask=tgt_mask, src_mask=source_mask)
-        next_tokens = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [B, 1]
-
-        # If a sequence already finished, keep padding or eos
-        next_tokens = torch.where(finished.unsqueeze(1), torch.full_like(next_tokens, eos_id), next_tokens)
-        generated = torch.cat([generated, next_tokens], dim=1)
-
-        finished = finished | (next_tokens.squeeze(1) == eos_id)
-        if finished.all():
-            break
-
-    return generated
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"[utils] saved plot to {save_path}")

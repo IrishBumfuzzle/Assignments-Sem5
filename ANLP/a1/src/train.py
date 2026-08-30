@@ -1,812 +1,569 @@
-"""Main training and evaluation loop for C1-C5 ablation experiments."""
+"""Main training/evaluation loop for the ANLP M26 Assignment 1 ablation study.
+
+Configs (Table 1 of the assignment):
+  C1  Base          : Sinusoidal PE + MHA    + LayerNorm + BPE subword
+  C2  RoPE          : RoPE           + MHA    + LayerNorm + BPE subword
+  C3  GQA           : Sinusoidal PE + GQA    + LayerNorm + BPE subword
+  C4  RMSNorm       : Sinusoidal PE + MHA    + RMSNorm   + BPE subword
+  C5  BLT           : Sinusoidal PE + MHA    + LayerNorm + Token-Free (raw bytes)
+
+Usage (C1 example):
+  python src/train.py --config C1 --epochs 15 --batch-size 8 --grad-accum-steps 2 \
+      --lr 5e-4 --dim 256 --heads 8 --layers 4 --max-src-len 1024 --max-tgt-len 512 \
+      --vocab-size 8000 --wandb
+"""
 
 import argparse
+import json
 import math
-from pathlib import Path
+import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import asdict
+
+import numpy as np
 import torch
 from torch import nn
 
-from dataset import ByteTokenizer, SubwordTokenizer, make_dataloaders
-from models.attention import FeedForward, GroupedQueryAttention, MultiHeadAttention
-from models.blt import LocalDecoder, LocalEncoder
-from models.norm import LayerNorm, RMSNorm
-from models.positional import RoPE, SinusoidalPositionalEncoding
-from utils import causal_mask, compute_metrics, greedy_decode, set_seed
+from dataset import (
+    BOS_ID,
+    BYTE_PAD,
+    EOS_ID,
+    PAD_ID,
+    BPETextTokenizer,
+    load_pairs,
+    make_dataloaders,
+)
+from models.transformer import BLTModel, Seq2SeqTransformer, TransformerConfig
+from utils import compute_metrics, plot_training_curves
+
+# --------------------------------------------------------------------------- #
+# Configs                                                                      #
+# --------------------------------------------------------------------------- #
+CONFIGS = {
+    "C1": dict(pos_encoding="sinusoidal", attention="mha",
+               norm="layernorm", tokenization="subword"),
+    "C2": dict(pos_encoding="rope", attention="mha",
+               norm="layernorm", tokenization="subword"),
+    "C3": dict(pos_encoding="sinusoidal", attention="gqa",
+               norm="layernorm", tokenization="subword"),
+    "C4": dict(pos_encoding="sinusoidal", attention="mha",
+               norm="rmsnorm", tokenization="subword"),
+    "C5": dict(pos_encoding="sinusoidal", attention="mha",
+               norm="layernorm", tokenization="blt"),
+}
 
 
-class TransformerEncoderLayer(nn.Module):
-    """Pre-LayerNorm Transformer Encoder Layer."""
-
-    def __init__(
-        self,
-        dim: int,
-        heads: int,
-        norm_type: str = "layer",
-        gqa: bool = False,
-        kv_heads: int = 4,
-        dropout: float = 0.1,
-        rope: Optional[RoPE] = None,
-    ):
-        super().__init__()
-        Norm = RMSNorm if norm_type == "rms" else LayerNorm
-        self.norm1 = Norm(dim)
-        self.norm2 = Norm(dim)
-
-        if gqa:
-            self.self_attn = GroupedQueryAttention(
-                dim=dim, heads=heads, kv_heads=kv_heads, dropout=dropout, rope=rope
-            )
-        else:
-            self.self_attn = MultiHeadAttention(
-                dim=dim, heads=heads, dropout=dropout, rope=rope
-            )
-
-        self.ffn = FeedForward(dim=dim, dropout=dropout)
-
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Pre-LN Self Attention with residual connection
-        x = x + self.self_attn(self.norm1(x), mask=mask)
-        # Pre-LN FFN with residual connection
-        x = x + self.ffn(self.norm2(x))
-        return x
-
-
-class TransformerDecoderLayer(nn.Module):
-    """Pre-LayerNorm Transformer Decoder Layer with Self-Attention and Cross-Attention."""
-
-    def __init__(
-        self,
-        dim: int,
-        heads: int,
-        norm_type: str = "layer",
-        gqa: bool = False,
-        kv_heads: int = 4,
-        dropout: float = 0.1,
-        rope: Optional[RoPE] = None,
-    ):
-        super().__init__()
-        Norm = RMSNorm if norm_type == "rms" else LayerNorm
-        self.norm1 = Norm(dim)
-        self.norm2 = Norm(dim)
-        self.norm3 = Norm(dim)
-
-        if gqa:
-            self.self_attn = GroupedQueryAttention(
-                dim=dim, heads=heads, kv_heads=kv_heads, dropout=dropout, rope=rope
-            )
-            self.cross_attn = GroupedQueryAttention(
-                dim=dim, heads=heads, kv_heads=kv_heads, dropout=dropout, rope=rope
-            )
-        else:
-            self.self_attn = MultiHeadAttention(
-                dim=dim, heads=heads, dropout=dropout, rope=rope
-            )
-            self.cross_attn = MultiHeadAttention(
-                dim=dim, heads=heads, dropout=dropout, rope=rope
-            )
-
-        self.ffn = FeedForward(dim=dim, dropout=dropout)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        memory: torch.Tensor,
-        tgt_mask: Optional[torch.Tensor] = None,
-        src_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        # Pre-LN Masked Self-Attention
-        x = x + self.self_attn(self.norm1(x), mask=tgt_mask)
-        # Pre-LN Cross-Attention to Encoder Memory
-        x = x + self.cross_attn(self.norm2(x), context=memory, mask=src_mask)
-        # Pre-LN FFN
-        x = x + self.ffn(self.norm3(x))
-        return x
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", type=str, required=True, choices=list(CONFIGS))
+    p.add_argument("--data-dir", type=str, default="data")
+    p.add_argument("--output-dir", type=str, default="outputs")
+    # training
+    p.add_argument("--epochs", type=int, default=15)
+    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--grad-accum-steps", type=int, default=2, 
+                   help="effective batch = batch-size * grad-accum-steps (default 16)")
+    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument("--min-lr", type=float, default=1e-5)
+    p.add_argument("--warmup-steps", type=int, default=250)
+    p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device", type=str, default="auto")
+    # architecture
+    p.add_argument("--dim", type=int, default=256)
+    p.add_argument("--heads", type=int, default=8)
+    p.add_argument("--kv-heads", type=int, default=4,
+                   help="KV heads for GQA (C3); ignored otherwise")
+    p.add_argument("--layers", type=int, default=4)
+    p.add_argument("--dim-ff", type=int, default=0, help="0 -> 4*dim")
+    p.add_argument("--dropout", type=float, default=0.1)
+    # data
+    p.add_argument("--max-src-len", type=int, default=1024)
+    p.add_argument("--max-tgt-len", type=int, default=512)
+    p.add_argument("--vocab-size", type=int, default=8000)
+    p.add_argument("--eval-batch-size", type=int, default=8)
+    p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--drop-last", action="store_true")
+    # BLT
+    p.add_argument("--patch-size", type=int, default=4)
+    p.add_argument("--byte-dim", type=int, default=64)
+    p.add_argument("--local-layers", type=int, default=2)
+    p.add_argument("--local-heads", type=int, default=4)
+    # logging / checkpoints
+    p.add_argument("--wandb", action="store_true")
+    p.add_argument("--wandb-project", type=str, default="anlp-assignment1")
+    p.add_argument("--wandb-entity", type=str, default=None)
+    p.add_argument("--hf-repo", type=str, default=None,
+                   help="HuggingFace repo id, e.g. user/anlp-a1 (uploaded per config)")
+    p.add_argument("--max-test-log-samples", type=int, default=10)
+    # smoke testing
+    p.add_argument("--quick", action="store_true",
+                   help="tiny subset + 2 epochs for a fast sanity check")
+    return p.parse_args()
 
 
-class TransformerModel(nn.Module):
-    """Full Encoder-Decoder Transformer supporting C1-C4 Ablations."""
-
-    def __init__(
-        self,
-        src_vocab: int,
-        tgt_vocab: int,
-        dim: int = 256,
-        heads: int = 8,
-        layers: int = 4,
-        norm_type: str = "layer",
-        gqa: bool = False,
-        kv_heads: int = 4,
-        use_rope: bool = False,
-        dropout: float = 0.1,
-        max_len: int = 8192,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.use_rope = use_rope
-
-        self.src_emb = nn.Embedding(src_vocab, dim)
-        self.tgt_emb = nn.Embedding(tgt_vocab, dim)
-
-        self.rope = RoPE(dim=dim // heads, max_len=max_len) if use_rope else None
-        self.pos_enc = SinusoidalPositionalEncoding(dim=dim, max_len=max_len) if not use_rope else None
-
-        self.encoder_layers = nn.ModuleList([
-            TransformerEncoderLayer(
-                dim=dim,
-                heads=heads,
-                norm_type=norm_type,
-                gqa=gqa,
-                kv_heads=kv_heads,
-                dropout=dropout,
-                rope=self.rope,
-            )
-            for _ in range(layers)
-        ])
-
-        self.decoder_layers = nn.ModuleList([
-            TransformerDecoderLayer(
-                dim=dim,
-                heads=heads,
-                norm_type=norm_type,
-                gqa=gqa,
-                kv_heads=kv_heads,
-                dropout=dropout,
-                rope=self.rope,
-            )
-            for _ in range(layers)
-        ])
-
-        Norm = RMSNorm if norm_type == "rms" else LayerNorm
-        self.final_enc_norm = Norm(dim)
-        self.final_dec_norm = Norm(dim)
-        self.out_proj = nn.Linear(dim, tgt_vocab)
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def encode(self, source: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if self.pos_enc is not None:
-            pe = self.pos_enc.pe[:, :source.size(1), :].to(device=source.device, dtype=self.src_emb.weight.dtype)
-            x = (self.src_emb(source) + pe) * math.sqrt(self.dim)
-        else:
-            x = self.src_emb(source) * math.sqrt(self.dim)
-        for layer in self.encoder_layers:
-            x = layer(x, mask=src_mask)
-        return self.final_enc_norm(x)
-
-    def decode(
-        self,
-        target: torch.Tensor,
-        memory: torch.Tensor,
-        tgt_mask: Optional[torch.Tensor] = None,
-        src_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if self.pos_enc is not None:
-            pe = self.pos_enc.pe[:, :target.size(1), :].to(device=target.device, dtype=self.tgt_emb.weight.dtype)
-            x = (self.tgt_emb(target) + pe) * math.sqrt(self.dim)
-        else:
-            x = self.tgt_emb(target) * math.sqrt(self.dim)
-        for layer in self.decoder_layers:
-            x = layer(x, memory=memory, tgt_mask=tgt_mask, src_mask=src_mask)
-        x = self.final_dec_norm(x)
-        return self.out_proj(x)
-
-    def forward(
-        self,
-        source: torch.Tensor,
-        target: torch.Tensor,
-        src_mask: Optional[torch.Tensor] = None,
-        tgt_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        memory = self.encode(source, src_mask=src_mask)
-        return self.decode(target, memory, tgt_mask=tgt_mask, src_mask=src_mask)
+# --------------------------------------------------------------------------- #
+# Helpers                                                                      #
+# --------------------------------------------------------------------------- #
+def set_seed(seed: int):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-class BLTSeq2Seq(nn.Module):
-    """Token-free Byte Latent Transformer (C5)."""
-
-    def __init__(
-        self,
-        vocab_size: int = 260,
-        dim: int = 256,
-        byte_dim: int = 64,
-        patch_size: int = 4,
-        heads: int = 8,
-        layers: int = 4,
-        dropout: float = 0.1,
-        max_len: int = 8192,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.patch_size = patch_size
-
-        self.src_local_enc = LocalEncoder(
-            byte_dim=byte_dim, model_dim=dim, patch_size=patch_size, vocab_size=vocab_size
-        )
-        self.tgt_local_enc = LocalEncoder(
-            byte_dim=byte_dim, model_dim=dim, patch_size=patch_size, vocab_size=vocab_size
-        )
-
-        self.pos_enc = SinusoidalPositionalEncoding(dim=dim, max_len=max_len)
-
-        self.encoder_layers = nn.ModuleList([
-            TransformerEncoderLayer(
-                dim=dim, heads=heads, norm_type="layer", gqa=False, dropout=dropout, rope=None
-            )
-            for _ in range(layers)
-        ])
-
-        self.decoder_layers = nn.ModuleList([
-            TransformerDecoderLayer(
-                dim=dim, heads=heads, norm_type="layer", gqa=False, dropout=dropout, rope=None
-            )
-            for _ in range(layers)
-        ])
-
-        self.final_enc_norm = LayerNorm(dim)
-        self.final_dec_norm = LayerNorm(dim)
-        self.local_decoder = LocalDecoder(
-            model_dim=dim, byte_dim=byte_dim, patch_size=patch_size, vocab_size=vocab_size
-        )
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def _downsample_mask(self, mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        if mask is None:
-            return None
-        b, t = mask.shape
-        pad_len = (-t) % self.patch_size
-        if pad_len > 0:
-            mask = torch.nn.functional.pad(mask, (0, pad_len), value=False)
-        return mask.view(b, -1, self.patch_size).any(dim=-1)
-
-    def encode(self, source: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # source: [B, T_bytes] -> patch_states: [B, T_patches, dim]
-        patches = self.src_local_enc(source)
-        pe = self.pos_enc.pe[:, :patches.size(1), :].to(device=patches.device, dtype=patches.dtype)
-        x = (patches + pe) * math.sqrt(self.dim)
-        patch_src_mask = self._downsample_mask(src_mask)
-        for layer in self.encoder_layers:
-            x = layer(x, mask=patch_src_mask)
-        return self.final_enc_norm(x)
-
-    def decode(
-        self,
-        target: torch.Tensor,
-        memory: torch.Tensor,
-        tgt_mask: Optional[torch.Tensor] = None,
-        src_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        target_len = target.size(1)
-        # target: [B, T_bytes] -> patch_states: [B, T_patches, dim]
-        patches = self.tgt_local_enc(target)
-        pe = self.pos_enc.pe[:, :patches.size(1), :].to(device=patches.device, dtype=patches.dtype)
-        x = (patches + pe) * math.sqrt(self.dim)
-
-        patch_src_mask = self._downsample_mask(src_mask)
-
-        patch_causal = causal_mask(x.size(1), device=x.device).unsqueeze(0).unsqueeze(0)
-        target_valid = target.ne(256)
-        patch_tgt_valid = self._downsample_mask(target_valid)
-        if patch_tgt_valid is not None:
-            patch_tgt_mask = patch_causal & patch_tgt_valid.unsqueeze(1).unsqueeze(2)
-        else:
-            patch_tgt_mask = patch_causal
-
-        for layer in self.decoder_layers:
-            x = layer(x, memory=memory, tgt_mask=patch_tgt_mask, src_mask=patch_src_mask)
-
-        x = self.final_dec_norm(x)
-        logits = self.local_decoder(x, target_len=target_len)
-        return logits
-
-    def forward(
-        self,
-        source: torch.Tensor,
-        target: torch.Tensor,
-        src_mask: Optional[torch.Tensor] = None,
-        tgt_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        memory = self.encode(source, src_mask=src_mask)
-        return self.decode(target, memory, tgt_mask=tgt_mask, src_mask=src_mask)
+def pick_device(pref: str) -> torch.device:
+    if pref != "auto":
+        return torch.device(pref)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def build_config(name: str) -> Dict[str, Any]:
-    """Return configuration dictionary for C1-C5."""
-    configs = {
-        "C1": {
-            "name": "C1_Base",
-            "pos": "sinusoidal",
-            "attn": "mha",
-            "norm": "layer",
-            "tokenization": "subword",
-            "use_rope": False,
-            "gqa": False,
-            "blt": False,
-        },
-        "C2": {
-            "name": "C2_RoPE",
-            "pos": "rope",
-            "attn": "mha",
-            "norm": "layer",
-            "tokenization": "subword",
-            "use_rope": True,
-            "gqa": False,
-            "blt": False,
-        },
-        "C3": {
-            "name": "C3_GQA",
-            "pos": "sinusoidal",
-            "attn": "gqa",
-            "norm": "layer",
-            "tokenization": "subword",
-            "use_rope": False,
-            "gqa": True,
-            "kv_heads": 4,
-            "blt": False,
-        },
-        "C4": {
-            "name": "C4_RMSNorm",
-            "pos": "sinusoidal",
-            "attn": "mha",
-            "norm": "rms",
-            "tokenization": "subword",
-            "use_rope": False,
-            "gqa": False,
-            "blt": False,
-        },
-        "C5": {
-            "name": "C5_BLT",
-            "pos": "sinusoidal",
-            "attn": "mha",
-            "norm": "layer",
-            "tokenization": "blt",
-            "use_rope": False,
-            "gqa": False,
-            "blt": True,
-        },
+def get_amp_settings(device: torch.device):
+    """Pick the right mixed-precision mode for the target GPU.
+
+    - Ampere or newer (compute capability >= 8.0): bfloat16, no GradScaler.
+    - Older GPUs (Turing/V100/2080-Ti, cc < 8.0): float16 + GradScaler.
+    - CPU: no autocast.
+
+    Returns (autocast_dtype or None, use_grad_scaler).
+    """
+    if device.type != "cuda":
+        return None, False
+    major, minor = torch.cuda.get_device_capability(device.index)
+    cc = major * 10 + minor
+    if cc >= 80:
+        return torch.bfloat16, False
+    return torch.float16, True
+
+
+def make_scheduler(opt, total_steps: int, warmup_steps: int, base_lr: float,
+                   min_lr: float):
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return max(step, 1) / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return (min_lr / base_lr) + cosine * (1.0 - min_lr / base_lr)
+    return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+
+
+def get_tokenizers(args, train_pairs, output_dir):
+    """Train (or load cached) BPE tokenizers for C1-C4."""
+    tok_dir = os.path.join(output_dir, "tokenizers")
+    tag = f"v{args.vocab_size}_s{args.seed}" + ("_quick" if args.quick else "")
+    paths = {
+        "cipher": os.path.join(tok_dir, f"cipher_bpe_{tag}.json"),
+        "plain": os.path.join(tok_dir, f"plain_bpe_{tag}.json"),
     }
-    if name not in configs:
-        raise ValueError(f"Unknown config '{name}'. Available: {list(configs.keys())}")
-    return configs[name]
+    cipher_tok = BPETextTokenizer(paths["cipher"]) if os.path.exists(paths["cipher"]) \
+        else BPETextTokenizer.train([c for c, _ in train_pairs], args.vocab_size,
+                                    tok_dir, f"cipher_bpe_{tag}")
+    plain_tok = BPETextTokenizer(paths["plain"]) if os.path.exists(paths["plain"]) \
+        else BPETextTokenizer.train([p for _, p in train_pairs], args.vocab_size,
+                                    tok_dir, f"plain_bpe_{tag}")
+    return cipher_tok, plain_tok
 
 
-def train_epoch(
-    model: nn.Module,
-    loader: Any,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-    device: torch.device,
-    scheduler: Optional[Any] = None,
-    scaler: Optional[torch.amp.GradScaler] = None,
-    grad_accum_steps: int = 1,
-) -> Tuple[float, float]:
-    """Train for one epoch with teacher forcing, AMP, and gradient accumulation."""
-    model.train()
-    total_loss = 0.0
-    start_time = time.time()
-    optimizer.zero_grad()
+def build_model(args, spec: dict, device: torch.device, src_vocab: int = None,
+                tgt_vocab: int = None):
+    max_len = max(args.max_src_len, args.max_tgt_len, 1024) + 32
+    tcfg = TransformerConfig(
+        d_model=args.dim,
+        n_heads=args.heads,
+        n_kv_heads=(args.kv_heads if spec["attention"] == "gqa" else args.heads),
+        n_layers=args.layers,
+        d_ff=args.dim_ff,
+        dropout=args.dropout,
+        max_len=max_len,
+        pos_encoding=spec["pos_encoding"],
+        norm=spec["norm"],
+    )
+    if spec["tokenization"] == "blt":
+        model = BLTModel(tcfg, patch_size=args.patch_size, byte_dim=args.byte_dim,
+                         n_local_layers=args.local_layers, n_local_heads=args.local_heads)
+    else:
+        model = Seq2SeqTransformer(src_vocab, tgt_vocab, tcfg,
+                                   pad_idx=PAD_ID, eos_idx=EOS_ID)
+    return model.to(device), tcfg
 
-    use_amp = scaler is not None and device.type == "cuda"
-    amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
 
-    for batch_idx, batch in enumerate(loader):
-        source = batch["source"].to(device)
-        target = batch["target"].to(device)
-        src_mask = batch["source_mask"].to(device)
-        target_mask = batch["target_mask"].to(device)
-
-        # Teacher forcing inputs: target[:, :-1] predicts target[:, 1:]
-        decoder_input = target[:, :-1]
-        target_labels = target[:, 1:]
-        decoder_input_mask = target_mask[:, :-1]
-
-        # Combine causal mask [1, 1, T_dec, T_dec] and key padding mask [B, 1, 1, T_dec]
-        c_mask = causal_mask(decoder_input.size(1), device=device).unsqueeze(0).unsqueeze(0)
-        tgt_mask = c_mask & decoder_input_mask.unsqueeze(1).unsqueeze(2)
-
-        with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-            logits = model(source, decoder_input, src_mask=src_mask, tgt_mask=tgt_mask)
-            vocab_size = logits.size(-1)
-            loss = criterion(logits.reshape(-1, vocab_size), target_labels.reshape(-1))
-            loss = loss / grad_accum_steps
-
-        if use_amp and scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
-
-        if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(loader):
-            if use_amp and scaler is not None:
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-            optimizer.zero_grad()
-            if scheduler is not None:
-                scheduler.step()
-
-        total_loss += loss.item() * grad_accum_steps
-
-    elapsed = time.time() - start_time
-    avg_loss = total_loss / max(1, len(loader))
-    return avg_loss, elapsed
+def train_step(model, batch, criterion, device, is_blt: bool):
+    if is_blt:
+        src, tgt = batch["src"].to(device), batch["tgt"].to(device)
+        mask = batch["src_mask"].to(device)
+        logits = model(src, mask)
+        logits = logits[:, : tgt.size(1)]  # align to padded byte length
+        return criterion(logits.reshape(-1, 256), tgt.reshape(-1))
+    src, tgt = batch["src"].to(device), batch["tgt"].to(device)
+    src_mask = batch["src_mask"].to(device)
+    logits = model(src, src_mask, tgt)
+    return criterion(logits.reshape(-1, logits.size(-1)), tgt[:, 1:].reshape(-1))
 
 
 @torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: Any,
-    criterion: nn.Module,
-    tokenizer: Any,
-    device: torch.device,
-    is_tokenized: bool = True,
-    max_decode_samples: int = 50,
-    use_amp: bool = True,
-) -> Dict[str, float]:
-    """Evaluate loss and greedy-decoding metrics on validation/test set."""
+def evaluate(model, loader, device, args, is_blt: bool, plain_tok=None, amp=None) -> dict:
+    """amp: (autocast_dtype, enabled) as returned by get_amp_settings."""
     model.eval()
-    raw_model = model.module if isinstance(model, nn.DataParallel) else model
-    total_loss = 0.0
-
-    amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
-    amp_enabled = use_amp and device.type == "cuda"
-
-    all_preds: list[str] = []
-    all_targets: list[str] = []
-
-    for idx, batch in enumerate(loader):
-        source = batch["source"].to(device)
-        target = batch["target"].to(device)
-        src_mask = batch["source_mask"].to(device)
-        target_mask = batch["target_mask"].to(device)
-
-        decoder_input = target[:, :-1]
-        target_labels = target[:, 1:]
-        decoder_input_mask = target_mask[:, :-1]
-
-        c_mask = causal_mask(decoder_input.size(1), device=device).unsqueeze(0).unsqueeze(0)
-        tgt_mask = c_mask & decoder_input_mask.unsqueeze(1).unsqueeze(2)
-
-        with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
-            logits = model(source, decoder_input, src_mask=src_mask, tgt_mask=tgt_mask)
-            vocab_size = logits.size(-1)
-            loss = criterion(logits.reshape(-1, vocab_size), target_labels.reshape(-1))
-        total_loss += loss.item()
-
-        # Run greedy decoding for metric calculation on a subset of samples
-        if len(all_preds) < max_decode_samples:
-            num_needed = min(source.size(0), max_decode_samples - len(all_preds))
-            sub_source = source[:num_needed]
-            sub_src_mask = src_mask[:num_needed] if src_mask is not None else None
-            sub_targets = batch["target_text"][:num_needed]
-
-            with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
-                decoded_tokens = greedy_decode(
-                    model=raw_model,
-                    source=sub_source,
-                    tokenizer=tokenizer,
-                    max_len=min(target.size(1) + 10, 512),
-                    source_mask=sub_src_mask,
-                    device=device,
-                )
-
-            for pred_ids, tgt_text in zip(decoded_tokens, sub_targets):
-                pred_str = tokenizer.decode(pred_ids, remove_special_tokens=True)
-                all_preds.append(pred_str)
-                all_targets.append(tgt_text)
-
-    metrics = compute_metrics(all_preds, all_targets, tokenized=is_tokenized)
-    metrics["loss"] = total_loss / max(1, len(loader))
+    preds, refs = [], []
+    if amp is None:
+        amp = get_amp_settings(device)
+    amp_dtype, amp_enabled = amp
+    for batch in loader:
+        src = batch["src"].to(device)
+        if is_blt:
+            lengths = batch["lengths"].to(device)
+            with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_enabled):
+                byte_lists = model.predict_bytes(src, lengths)
+            preds.extend([bytes(b).decode("latin1") for b in byte_lists])
+        else:
+            src_mask = batch["src_mask"].to(device)
+            max_len = min(args.max_tgt_len, int(batch["tgt"].size(1)))
+            with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_enabled):
+                ids = model.generate(src, src_mask, max_len, BOS_ID)
+            for row in ids:
+                row = row.tolist()
+                if EOS_ID in row:
+                    row = row[: row.index(EOS_ID) + 1]
+                preds.append(plain_tok.decode(row))
+        refs.extend(loader.dataset.refs())
+    metrics = compute_metrics(refs, preds, tokenized=not is_blt)
+    metrics["_preds"] = preds[: args.max_test_log_samples]
+    metrics["_refs"] = refs[: args.max_test_log_samples]
     return metrics
 
 
-def configure_optimizers(model: nn.Module, lr: float, weight_decay: float = 1e-2) -> torch.optim.Optimizer:
-    """Separate model parameters into decay (2D+ weight matrices) and no_decay (biases, norms, embeddings)."""
-    decay_params = []
-    no_decay_params = []
+def log_samples(wandb_run, metrics: dict, step_name: str):
+    if wandb_run is None:
+        return
+    import wandb
 
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        # Biases, 1D normalization weights, scales, and embeddings are excluded from weight decay
-        if (
-            param.dim() < 2
-            or "norm" in name.lower()
-            or "emb" in name.lower()
-            or "bias" in name.lower()
-            or "scale" in name.lower()
-        ):
-            no_decay_params.append(param)
-        else:
-            decay_params.append(param)
-
-    optim_groups = [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
-    return torch.optim.AdamW(optim_groups, lr=lr)
-
-
-def get_lr_scheduler(
-    optimizer: torch.optim.Optimizer, warmup_steps: int, total_steps: int, min_lr_ratio: float = 0.01
-) -> torch.optim.lr_scheduler.LambdaLR:
-    """Cosine learning rate scheduler with linear warmup."""
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return float(step) / float(max(1, warmup_steps))
-        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Train custom transformer architectures C1-C5.")
-    parser.add_argument(
-        "--config",
-        choices=["C1", "C2", "C3", "C4", "C5"],
-        default="C1",
-        help="Ablation configuration",
-    )
-    parser.add_argument("--data-dir", default="data", help="Directory containing dataset files")
-    parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
-    parser.add_argument("--lr", type=float, default=5e-4, help="Peak learning rate")
-    parser.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps")
-    parser.add_argument("--no-amp", action="store_true", help="Disable Automatic Mixed Precision (AMP)")
-    parser.add_argument("--warmup-ratio", type=float, default=0.05, help="Warmup ratio for cosine scheduler")
-    parser.add_argument("--vocab-size", type=int, default=8000, help="Subword BPE vocabulary size")
-    parser.add_argument("--dim", type=int, default=256, help="Model embedding dimension")
-    parser.add_argument("--heads", type=int, default=8, help="Number of attention heads")
-    parser.add_argument("--layers", type=int, default=4, help="Number of transformer layers")
-    parser.add_argument("--max-src-len", type=int, default=1024, help="Max source sequence length")
-    parser.add_argument("--max-tgt-len", type=int, default=512, help="Max target sequence length")
-    parser.add_argument("--patch-size", type=int, default=4, help="BLT patch size (e.g. 4 or 8)")
-    parser.add_argument("--byte-dim", type=int, default=64, help="BLT byte dimension")
-    parser.add_argument("--wandb", action="store_true", help="Enable WandB logging")
-    parser.add_argument("--wandb-project", default="anlp-assignment1", help="WandB project name")
-    parser.add_argument("--wandb-entity", default="irishbumfuzzle-team", help="WandB team/entity name")
-    parser.add_argument("--output-dir", default="outputs", help="Output directory for checkpoints")
-    args = parser.parse_args()
-
-    set_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    if num_gpus > 0:
-        print(f"Using device: {device} ({num_gpus} GPU{'s' if num_gpus > 1 else ''} detected)")
-    else:
-        print(f"Using device: {device}")
-
-    cfg = build_config(args.config)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Initialize Tokenizer & DataLoaders
-    cipher_file = f"{args.data_dir}/brown_cipher.txt"
-    plain_file = f"{args.data_dir}/brown_plain.txt"
-
-    cipher_path = Path(cipher_file)
-    plain_path = Path(plain_file)
-    if not cipher_path.exists() or not plain_path.exists():
-        raise FileNotFoundError(
-            f"Dataset files '{cipher_path}' or '{plain_path}' not found.\n"
-            f"Please download the dataset files into the '{args.data_dir}' folder or specify --data-dir."
+    rows = [[r, p] for r, p in zip(metrics["_refs"], metrics["_preds"])]
+    wandb_run.log({
+        f"samples_{step_name}": wandb.Table(
+            data=rows, columns=["reference", "prediction"]
         )
+    })
 
-    if cfg["blt"]:
-        tokenizer = ByteTokenizer()
-    else:
-        # None enables make_dataloaders to train SubwordTokenizer strictly on the training split
-        tokenizer = None
 
-    train_loader, val_loader, test_loader, tokenizer = make_dataloaders(
-        cipher_path=cipher_file,
-        plain_path=plain_file,
-        tokenizer=tokenizer,
-        batch_size=args.batch_size,
-        max_src_len=args.max_src_len,
-        max_tgt_len=args.max_tgt_len,
-        vocab_size=args.vocab_size,
+def save_checkpoint(path, model, tcfg, args, epoch, metrics):
+    torch.save({
+        "model": model.state_dict(),
+        "tcfg": asdict(tcfg),
+        "args": vars(args),
+        "epoch": epoch,
+        "metrics": {k: v for k, v in metrics.items() if not k.startswith("_")},
+    }, path)
+
+
+def upload_to_hf(args, output_dir: str) -> str:
+    """Upload the best checkpoint, config, results and tokenizers to HuggingFace."""
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        print("[hf] huggingface_hub not installed - skipping upload "
+              "(pip install huggingface_hub)")
+        return ""
+    api = HfApi()
+    repo = args.hf_repo
+    try:
+        api.create_repo(repo, exist_ok=True)
+    except Exception as e:  # token missing / offline
+        print(f"[hf] could not create repo {repo}: {e}")
+        return ""
+    files = []
+    for fn in ("model_best.pt", "model_last.pt", "config.json", "results.json"):
+        p = os.path.join(output_dir, fn)
+        if os.path.exists(p):
+            files.append(p)
+    tok_dir = os.path.join(output_dir, "tokenizers")
+    if os.path.isdir(tok_dir):
+        files += [os.path.join(tok_dir, f) for f in os.listdir(tok_dir)]
+    for f in files:
+        url = api.upload_file(
+            path_or_fileobj=f,
+            path_in_repo=os.path.basename(f),
+            repo_id=repo,
+        )
+        print(f"[hf] uploaded {f} -> {url}")
+    return api.repo_url(repo)
+
+
+# --------------------------------------------------------------------------- #
+# Main                                                                         #
+# --------------------------------------------------------------------------- #
+def main():
+    args = parse_args()
+    spec = CONFIGS[args.config]
+    set_seed(args.seed)
+    device = pick_device(args.device)
+    is_blt = spec["tokenization"] == "blt"
+
+    output_dir = os.path.join(args.output_dir, args.config)
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"=== Config {args.config}: {spec} ===")
+    print(f"device: {device}")
+
+    # ---------------- data ----------------
+    t0 = time.time()
+    pairs = load_pairs(
+        os.path.join(args.data_dir, "brown_cipher.txt"),
+        os.path.join(args.data_dir, "brown_plain.txt"),
     )
+    print(f"[data] {len(pairs)} pairs loaded & verified in {time.time() - t0:.1f}s")
 
-    # Build Model
-    vocab_size = len(tokenizer)
-    if cfg["blt"]:
-        model = BLTSeq2Seq(
-            vocab_size=vocab_size,
-            dim=args.dim,
-            byte_dim=args.byte_dim,
-            patch_size=args.patch_size,
-            heads=args.heads,
-            layers=args.layers,
-        ).to(device)
-    else:
-        model = TransformerModel(
-            src_vocab=vocab_size,
-            tgt_vocab=vocab_size,
-            dim=args.dim,
-            heads=args.heads,
-            layers=args.layers,
-            norm_type=cfg["norm"],
-            gqa=cfg["gqa"],
-            kv_heads=cfg.get("kv_heads", 4),
-            use_rope=cfg["use_rope"],
-        ).to(device)
+    rng = np.random.default_rng(args.seed)
+    idx = rng.permutation(len(pairs))
+    n_train = int(0.8 * len(pairs))
+    n_val = int(0.1 * len(pairs))
+    split = {
+        "train": [pairs[i] for i in idx[:n_train]],
+        "val": [pairs[i] for i in idx[n_train : n_train + n_val]],
+        "test": [pairs[i] for i in idx[n_train + n_val :]],
+    }
 
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model Configuration: {cfg['name']} | Trainable parameters: {total_params:,}")
+    if args.quick:
+        split = {k: v[: 256 if k == "train" else 64] for k, v in split.items()}
+        args.epochs = 2
+        args.eval_batch_size = 8
+        print("[quick] smoke-test mode: subset + 2 epochs")
 
-    # Multi-GPU DataParallel Support
-    if num_gpus > 1:
-        print(f"Enabling DataParallel across {num_gpus} GPUs (effective batch size: {args.batch_size})")
-        model = nn.DataParallel(model)
+    tokenizers = None
+    plain_tok = None
+    if not is_blt:
+        t0 = time.time()
+        cipher_tok, plain_tok = get_tokenizers(args, split["train"], output_dir)
+        tokenizers = (cipher_tok, plain_tok)
+        print(f"[bpe] trained/loaded tokenizers in {time.time() - t0:.1f}s "
+              f"(cipher vocab={cipher_tok.vocab_size}, plain vocab={plain_tok.vocab_size})")
 
-    # WandB Setup
+    loaders = make_dataloaders(split, args, tokenizers)
+    for name in ("train", "val", "test"):
+        print(f"[data] {name}: {len(loaders[name].dataset)} samples")
+
+    # ---------------- model / optimizer ----------------
+    src_vocab = cipher_tok.vocab_size if not is_blt else None
+    tgt_vocab = plain_tok.vocab_size if not is_blt else None
+    model, tcfg = build_model(args, spec, device, src_vocab, tgt_vocab)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[model] {n_params / 1e6:.2f}M params; {tcfg.describe()}")
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        json.dump({"config": args.config, "spec": spec, "tcfg": asdict(tcfg),
+                   "n_params": n_params, "args": vars(args)}, f, indent=2, default=str)
+
+    criterion = nn.CrossEntropyLoss(ignore_index=BYTE_PAD if is_blt else PAD_ID)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                            weight_decay=args.weight_decay)
+    steps_per_epoch = max(len(loaders["train"]) // args.grad_accum_steps, 1)
+    total_steps = steps_per_epoch * args.epochs
+    sched = make_scheduler(opt, total_steps, args.warmup_steps, args.lr, args.min_lr)
+    amp_dtype, use_scaler = get_amp_settings(device)
+    amp_enabled = amp_dtype is not None
+    amp = (amp_dtype, amp_enabled)
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    except (AttributeError, TypeError):  # older torch
+        scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    if device.type == "cuda":
+        print(f"[amp] autocast dtype={amp_dtype}, grad_scaler={use_scaler}")
+
+    # ---------------- wandb ----------------
     wandb_run = None
-    if args.wandb:
+    if args.wandb and not args.quick:
         try:
             import wandb
-            wandb_run = wandb.init(
-                project=args.wandb_project,
-                entity=args.wandb_entity,
-                name=cfg["name"],
-                config={**cfg, **vars(args), "num_gpus": num_gpus, "trainable_params": total_params},
-            )
-        except Exception as e:
-            print(f"WandB initialization failed or offline: {e}")
+            if not (os.environ.get("WANDB_API_KEY") or os.environ.get("WANDB_MODE") == "offline"):
+                print("[wandb] WANDB_API_KEY not set - running without wandb")
+            else:
+                wandb_run = wandb.init(
+                    project=args.wandb_project,
+                    entity=args.wandb_entity,
+                    name=f"{args.config}",
+                    config=vars(args),
+                    mode="online" if os.environ.get("WANDB_API_KEY") else "offline",
+                )
+        except ImportError:
+            print("[wandb] not installed - running without wandb")
 
-    use_amp = (not args.no_amp) and (device.type == "cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    if use_amp:
-        print("Automatic Mixed Precision (AMP) enabled.")
-
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_id)
-    optimizer = configure_optimizers(model, lr=args.lr, weight_decay=1e-2)
-
-    total_steps = (len(train_loader) // args.grad_accum_steps) * args.epochs
-    warmup_steps = int(args.warmup_ratio * total_steps)
-    scheduler = get_lr_scheduler(optimizer, warmup_steps=warmup_steps, total_steps=total_steps)
-
-    best_val_loss = float("inf")
-    checkpoint_path = output_dir / f"{cfg['name']}_checkpoint.pt"
-
-    print("\nStarting Training...")
-    print("-" * 75)
+    # ---------------- training loop ----------------
+    history = {k: [] for k in ("epoch", "train_loss", "val_loss", "val_bit_accuracy",
+                               "val_sequence_accuracy", "val_levenshtein", "val_bleu",
+                               "val_rouge_l", "train_samples_per_sec", "peak_mem_mb")}
+    best_val = (float("inf"), 0.0)  # (loss, seq_acc)
+    global_step = 0
+    t_start = time.time()
 
     for epoch in range(1, args.epochs + 1):
-        if torch.cuda.is_available():
-            for i in range(num_gpus):
-                torch.cuda.reset_peak_memory_stats(i)
+        model.train()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        epoch_loss, n_batches, t_ep = 0.0, 0, time.time()
+        opt.zero_grad(set_to_none=True)
 
-        train_loss, train_time = train_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            criterion=criterion,
-            device=device,
-            scheduler=scheduler,
-            scaler=scaler,
-            grad_accum_steps=args.grad_accum_steps,
-        )
+        for i, batch in enumerate(loaders["train"]):
+            with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_enabled):
+                loss = train_step(model, batch, criterion, device, is_blt)
+            if use_scaler:
+                scaler.scale(loss / args.grad_accum_steps).backward()
+            else:
+                (loss / args.grad_accum_steps).backward()
+            epoch_loss += loss.item()
+            n_batches += 1
+            if (i + 1) % args.grad_accum_steps == 0:
+                if use_scaler:
+                    scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                if use_scaler:
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    opt.step()
+                sched.step()
+                opt.zero_grad(set_to_none=True)
+                global_step += 1
+                if wandb_run is not None and global_step % 25 == 0:
+                    wandb_run.log({"train/loss": epoch_loss / n_batches,
+                                   "train/lr": opt.param_groups[0]["lr"],
+                                   "train/step": global_step})
 
-        # Measure peak training GPU memory usage across all GPUs
-        if num_gpus > 1:
-            peak_train_gpu_mb = sum(torch.cuda.max_memory_allocated(i) for i in range(num_gpus)) / (1024 * 1024)
-        elif num_gpus == 1:
-            peak_train_gpu_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
-        else:
-            peak_train_gpu_mb = 0.0
+        # Flush a trailing partial accumulation group, if any.
+        if n_batches % args.grad_accum_steps != 0:
+            if use_scaler:
+                scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            if use_scaler:
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
+            sched.step()
+            opt.zero_grad(set_to_none=True)
+            global_step += 1
 
-        val_metrics = evaluate(
-            model=model,
-            loader=val_loader,
-            criterion=criterion,
-            tokenizer=tokenizer,
-            device=device,
-            is_tokenized=not cfg["blt"],
-            use_amp=use_amp,
-        )
+        epoch_time = time.time() - t_ep
+        peak_mb = (torch.cuda.max_memory_allocated() / 1e6) if device.type == "cuda" else 0.0
+        train_loss = epoch_loss / max(n_batches, 1)
+        n_train_samples = len(loaders["train"].dataset)
+        sps = n_train_samples / epoch_time
 
-        gpu_info_str = f"Peak Train GPU: {peak_train_gpu_mb:.1f} MB"
-        if num_gpus > 1:
-            gpu_breakdown = ", ".join(f"GPU{i}: {torch.cuda.max_memory_allocated(i)/(1024*1024):.0f}MB" for i in range(num_gpus))
-            gpu_info_str += f" ({gpu_breakdown})"
+        # ---------------- validation ----------------
+        model.eval()
+        val_logits_loss = 0.0
+        val_n = 0
+        for batch in loaders["val"]:
+            with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_enabled):
+                vloss = train_step(model, batch, criterion, device, is_blt)
+            val_logits_loss += vloss.item() * batch["src"].size(0)
+            val_n += batch["src"].size(0)
+        val_loss = val_logits_loss / max(val_n, 1)
+        val_metrics = evaluate(model, loaders["val"], device, args, is_blt, plain_tok, amp)
 
-        print(
-            f"Epoch {epoch:02d}/{args.epochs:02d} | "
-            f"Train Loss: {train_loss:.4f} | "
-            f"Val Loss: {val_metrics['loss']:.4f} | "
-            f"Bit Acc: {val_metrics['bit_accuracy']:.2%} | "
-            f"Seq Acc: {val_metrics['sequence_accuracy']:.2%} | "
-            f"Time: {train_time:.1f}s | "
-            f"{gpu_info_str}"
-        )
+        history["epoch"].append(epoch)
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["val_bit_accuracy"].append(val_metrics["bit_accuracy"])
+        history["val_sequence_accuracy"].append(val_metrics["sequence_accuracy"])
+        history["val_levenshtein"].append(val_metrics["levenshtein"])
+        history["val_bleu"].append(val_metrics.get("bleu"))
+        history["val_rouge_l"].append(val_metrics.get("rouge_l"))
+        history["train_samples_per_sec"].append(sps)
+        history["peak_mem_mb"].append(peak_mb)
 
-        if wandb_run:
-            wandb.log({
+        print(f"[{args.config}] epoch {epoch:02d} | train_loss {train_loss:.4f} | "
+              f"val_loss {val_loss:.4f} | bit_acc {val_metrics['bit_accuracy']:.4f} | "
+              f"seq_acc {val_metrics['sequence_accuracy']:.4f} | "
+              f"lev {val_metrics['levenshtein']:.1f} | "
+              f"bleu {val_metrics.get('bleu', float('nan')):.4f} | "
+              f"rougeL {val_metrics.get('rouge_l', float('nan')):.4f} | "
+              f"{sps:.0f} samples/s | peak {peak_mb:.0f} MB | {epoch_time:.0f}s")
+
+        # ---------------- checkpoints / logging ----------------
+        improved = epoch == 1 or (math.isfinite(val_loss) and val_loss < best_val[0])
+        if improved:
+            best_val = (val_loss, val_metrics["sequence_accuracy"])
+            save_checkpoint(os.path.join(output_dir, "model_best.pt"), model, tcfg,
+                            args, epoch, val_metrics)
+        save_checkpoint(os.path.join(output_dir, "model_last.pt"), model, tcfg,
+                        args, epoch, val_metrics)
+
+        if wandb_run is not None:
+            wandb_run.log({
+                "train/epoch_loss": train_loss,
+                "val/loss": val_loss,
+                "val/bit_accuracy": val_metrics["bit_accuracy"],
+                "val/sequence_accuracy": val_metrics["sequence_accuracy"],
+                "val/levenshtein": val_metrics["levenshtein"],
+                "val/bleu": val_metrics.get("bleu"),
+                "val/rouge_l": val_metrics.get("rouge_l"),
+                "train/samples_per_sec": sps,
+                "train/peak_mem_mb": peak_mb,
+                "train/epoch_time_s": epoch_time,
                 "epoch": epoch,
-                "train_loss": train_loss,
-                "val_loss": val_metrics["loss"],
-                "bit_accuracy": val_metrics["bit_accuracy"],
-                "sequence_accuracy": val_metrics["sequence_accuracy"],
-                "levenshtein": val_metrics["levenshtein"],
-                "bleu": val_metrics.get("bleu"),
-                "rouge": val_metrics.get("rouge"),
-                "epoch_time_sec": train_time,
-                "peak_gpu_mb": peak_train_gpu_mb,
             })
+            log_samples(wandb_run, val_metrics, f"epoch_{epoch}")
+        if epoch == 1:
+            with open(os.path.join(output_dir, "val_samples_epoch1.txt"), "w") as f:
+                for r, p in zip(val_metrics["_refs"], val_metrics["_preds"]):
+                    f.write(f"REF:  {r}\nPRED: {p}\n{'-' * 80}\n")
 
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
-            tokenizer_saved_path = None
-            if hasattr(tokenizer, "save"):
-                tokenizer_file = output_dir / f"{cfg['name']}_tokenizer.json"
-                tokenizer.save(tokenizer_file)
-                tokenizer_saved_path = str(tokenizer_file)
+    total_time = time.time() - t_start
+    print(f"[{args.config}] training done in {total_time / 60:.1f} min")
 
-            raw_model = model.module if isinstance(model, nn.DataParallel) else model
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state": raw_model.state_dict(),
-                    "config": cfg,
-                    "val_metrics": val_metrics,
-                    "tokenizer_type": "byte" if cfg["blt"] else "subword",
-                    "tokenizer_path": tokenizer_saved_path,
-                },
-                checkpoint_path,
-            )
+    # ---------------- final test with best checkpoint ----------------
+    ckpt = torch.load(os.path.join(output_dir, "model_best.pt"), map_location=device,
+                      weights_only=False)
+    model.load_state_dict(ckpt["model"])
+    test_metrics = evaluate(model, loaders["test"], device, args, is_blt, plain_tok, amp)
+    results = {
+        "config": args.config,
+        "spec": spec,
+        "n_params": n_params,
+        "train_samples": len(loaders["train"].dataset),
+        "val_samples": len(loaders["val"].dataset),
+        "test_samples": len(loaders["test"].dataset),
+        "epochs": args.epochs,
+        "total_time_min": total_time / 60,
+        "best_epoch": ckpt["epoch"],
+        "best_val_loss": best_val[0],
+        "test": {k: v for k, v in test_metrics.items() if not k.startswith("_")},
+        "history": {k: v for k, v in history.items()},
+    }
+    with open(os.path.join(output_dir, "results.json"), "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    with open(os.path.join(output_dir, "test_samples.txt"), "w") as f:
+        for r, p in zip(test_metrics["_refs"], test_metrics["_preds"]):
+            f.write(f"REF:  {r}\nPRED: {p}\n{'-' * 80}\n")
 
-    print("-" * 75)
-    print(f"Training completed. Best Val Loss: {best_val_loss:.4f}. Saved checkpoint: {checkpoint_path}")
+    print(f"[{args.config}] TEST: bit_acc {test_metrics['bit_accuracy']:.4f} | "
+          f"seq_acc {test_metrics['sequence_accuracy']:.4f} | "
+          f"lev {test_metrics['levenshtein']:.1f} | "
+          f"bleu {test_metrics.get('bleu', float('nan')):.4f} | "
+          f"rougeL {test_metrics.get('rouge_l', float('nan')):.4f}")
 
-    # Evaluate on Test Set using best checkpoint
-    raw_model = model.module if isinstance(model, nn.DataParallel) else model
-    if checkpoint_path.exists():
-        print(f"\nLoading best checkpoint from '{checkpoint_path}' for final evaluation on Test Set...")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        raw_model.load_state_dict(checkpoint["model_state"])
-    else:
-        print("\nRunning final evaluation on Test Set...")
+    plot_training_curves(history, os.path.join(output_dir, "training_curves.png"))
 
-    test_metrics = evaluate(
-        model=model,
-        loader=test_loader,
-        criterion=criterion,
-        tokenizer=tokenizer,
-        device=device,
-        is_tokenized=not cfg["blt"],
-        use_amp=use_amp,
-    )
-    print(f"Test Results for {cfg['name']}:")
-    for k, v in test_metrics.items():
-        if v is not None:
-            print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+    if wandb_run is not None:
+        wandb_run.log({"test/bit_accuracy": test_metrics["bit_accuracy"],
+                       "test/sequence_accuracy": test_metrics["sequence_accuracy"],
+                       "test/levenshtein": test_metrics["levenshtein"],
+                       "test/bleu": test_metrics.get("bleu"),
+                       "test/rouge_l": test_metrics.get("rouge_l"),
+                       "train/avg_samples_per_sec":
+                           float(np.mean(history["train_samples_per_sec"])),
+                       "train/avg_peak_mem_mb":
+                           float(np.mean(history["peak_mem_mb"])),
+                       "train/total_time_min": total_time / 60})
+        log_samples(wandb_run, test_metrics, "test")
+        wandb_run.finish()
 
-    if wandb_run:
-        wandb.summary.update({f"test_{k}": v for k, v in test_metrics.items() if v is not None})
-        wandb.finish()
+    hf_url = ""
+    if args.hf_repo:
+        hf_url = upload_to_hf(args, output_dir)
+        results["hf_url"] = hf_url
+        with open(os.path.join(output_dir, "results.json"), "w") as f:
+            json.dump(results, f, indent=2, default=str)
+
+    return results
 
 
 if __name__ == "__main__":

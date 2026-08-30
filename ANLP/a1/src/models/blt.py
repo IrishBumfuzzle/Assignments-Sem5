@@ -1,100 +1,165 @@
-"""Byte Latent Transformer (BLT) modules: Local Encoder and Local Decoder."""
+"""Byte Latent Transformer (BLT) local encoder/decoder patch modules.
 
-from typing import Optional
+Token-free processing: instead of a linguistic vocabulary, the model consumes
+raw byte values (0-255) directly.
+
+- LocalByteEncoder: groups raw bytes into fixed patches of ``patch_size``
+  bytes, embeds each byte, runs a small transformer over the ``patch_size``
+  positions of each patch, and mean-pools (mask-aware) to a single latent
+  vector per patch, projected to the global model dimension.
+- LocalByteDecoder: takes one latent per patch and expands it back into
+  ``patch_size`` byte distributions (one per byte position) using learned
+  slot queries that cross-attend to the patch latent.
+
+Padding byte id: ``BYTE_PAD = 256`` (outside the real 0-255 range).
+"""
+
+import math
+from typing import Optional, Tuple
+
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
+
+from .attention import FeedForward, MultiHeadAttention, TransformerEncoderLayer
+from .norm import LayerNorm
+
+BYTE_PAD = 256
+N_BYTES = 256
 
 
-class LocalEncoder(nn.Module):
-    """Local Encoder for BLT: converts raw byte sequences into patch representations.
-
-    Input: [B, T_bytes] -> Output: [B, T_patches, model_dim]
-    """
+class LocalByteEncoder(nn.Module):
+    """Patches raw bytes (B, L) -> (B, L/patch_size, d_model) latents."""
 
     def __init__(
         self,
         byte_dim: int = 64,
-        model_dim: int = 256,
         patch_size: int = 4,
-        vocab_size: int = 260,  # 256 byte values + PAD(0), BOS(256), EOS(257), UNK(258)
+        d_model: int = 256,
+        n_local_layers: int = 2,
+        n_local_heads: int = 4,
+        dropout: float = 0.1,
+        norm_layer=None,
     ):
         super().__init__()
-        self.patch_size = patch_size
+        norm_layer = norm_layer or LayerNorm
+        assert byte_dim % n_local_heads == 0
         self.byte_dim = byte_dim
-        self.model_dim = model_dim
-        self.vocab_size = vocab_size
-
-        self.embedding = nn.Embedding(vocab_size, byte_dim)
-        self.proj = nn.Sequential(
-            nn.Linear(byte_dim * patch_size, model_dim),
-            nn.GELU(),
-            nn.Linear(model_dim, model_dim),
+        self.patch_size = patch_size
+        # 256 real byte values + one learned pad embedding (id 256).
+        self.byte_embed = nn.Embedding(N_BYTES + 1, byte_dim, padding_idx=BYTE_PAD)
+        self.local_pos = nn.Embedding(patch_size, byte_dim)
+        self.layers = nn.ModuleList(
+            TransformerEncoderLayer(
+                byte_dim,
+                n_local_heads,
+                n_kv_heads=None,  # MHA inside the patch
+                d_ff=4 * byte_dim,
+                dropout=dropout,
+                norm_layer=norm_layer,
+            )
+            for _ in range(n_local_layers)
         )
-        self.layer_norm = nn.LayerNorm(model_dim)
+        self.proj = nn.Linear(byte_dim, d_model)
 
-    def forward(self, byte_ids: torch.Tensor) -> torch.Tensor:
-        """Args:
+    def forward(
+        self, byte_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """byte_ids: (B, L) with values in 0..255 and BYTE_PAD for padding.
 
-        byte_ids: [B, T_bytes]
-
-        Returns:
-            patch_embeddings: [B, T_patches, model_dim]
+        Returns (latents (B, N, d_model), patch_mask (B, N) True=has real byte).
         """
-        b, t = byte_ids.shape
-        pad_len = (-t) % self.patch_size
-        if pad_len > 0:
-            byte_ids = F.pad(byte_ids, (0, pad_len), value=256)
+        B, L = byte_ids.shape
+        P = self.patch_size
+        rem = (-L) % P
+        if rem:
+            byte_ids = F.pad(byte_ids, (0, rem), value=BYTE_PAD)
+        Lp = byte_ids.size(1)
+        N = Lp // P
 
-        # [B, T_padded, byte_dim]
-        embeds = self.embedding(byte_ids)
-        # [B, T_patches, patch_size * byte_dim]
-        patches = embeds.view(b, -1, self.patch_size * self.byte_dim)
-        # [B, T_patches, model_dim]
-        out = self.layer_norm(self.proj(patches))
-        return out
+        x = byte_ids.view(B, N, P)
+        pad_tok = x == BYTE_PAD  # (B, N, P)
+        e = self.byte_embed(x) + self.local_pos.weight[None, None, :]
+
+        # Key mask: attend to real bytes.  Fully-padded patches must keep one
+        # key unmasked, otherwise their attention rows are all -inf -> NaN
+        # values *and* NaN gradients through the softmax backward.
+        key_ok = ~pad_tok
+        empty = ~key_ok.any(dim=2, keepdim=True)  # (B, N, 1)
+        slot0 = torch.arange(P, device=x.device)[None, None, :] == 0
+        key_ok = key_ok | (empty & slot0)
+
+        # (B, N, P) -> (BN, 1, 1, P), broadcast over heads and query slots.
+        BN = B * N
+        flat = e.reshape(BN, P, self.byte_dim)
+        flat_mask = key_ok.reshape(BN, 1, 1, P)
+        for layer in self.layers:
+            flat, _ = layer(flat, mask=flat_mask)
+        e = flat.reshape(B, N, P, self.byte_dim)
+
+        wts = (~pad_tok).float()  # (B, N, P)
+        # Fully-padded patches produce all-(-inf) attention rows (NaN outputs);
+        # zero every padded slot before pooling so NaN * 0 cannot contaminate.
+        e = torch.where(pad_tok.unsqueeze(-1), torch.zeros_like(e), e)
+        latents = (e * wts.unsqueeze(-1)).sum(dim=2) / wts.sum(dim=2, keepdim=True).clamp(min=1.0)
+        patch_mask = (~pad_tok).any(dim=2)
+        # Empty patches -> zero latent (masked out by the global encoder).
+        latents = torch.where(patch_mask.unsqueeze(-1), latents, torch.zeros_like(latents))
+        return self.proj(latents), patch_mask
 
 
-class LocalDecoder(nn.Module):
-    """Local Decoder for BLT: converts patch representations back to byte logits.
-
-    Input: [B, T_patches, model_dim] -> Output: [B, T_bytes, vocab_size]
-    """
+class LocalByteDecoder(nn.Module):
+    """Expands one latent per patch back to patch_size byte distributions."""
 
     def __init__(
         self,
-        model_dim: int = 256,
         byte_dim: int = 64,
         patch_size: int = 4,
-        vocab_size: int = 260,
+        d_model: int = 256,
+        n_local_heads: int = 4,
+        dropout: float = 0.1,
+        norm_layer=None,
     ):
         super().__init__()
-        self.patch_size = patch_size
+        norm_layer = norm_layer or LayerNorm
+        assert byte_dim % n_local_heads == 0
         self.byte_dim = byte_dim
-        self.vocab_size = vocab_size
+        self.patch_size = patch_size
+        self.latent_proj = nn.Linear(d_model, byte_dim)
+        # One learned query slot per byte position inside a patch.
+        self.slot_query = nn.Parameter(0.02 * torch.randn(patch_size, byte_dim))
+        self.slot_pos = nn.Embedding(patch_size, byte_dim)
+        self.self_attn = MultiHeadAttention(byte_dim, n_local_heads, dropout=dropout)
+        self.cross_attn = MultiHeadAttention(byte_dim, n_local_heads, dropout=dropout)
+        self.ffn = FeedForward(byte_dim, 4 * byte_dim, dropout)
+        self.norm1 = norm_layer(byte_dim)
+        self.norm2 = norm_layer(byte_dim)
+        self.norm3 = norm_layer(byte_dim)
+        self.drop = nn.Dropout(dropout)
+        self.byte_head = nn.Linear(byte_dim, N_BYTES)
 
-        self.proj = nn.Sequential(
-            nn.Linear(model_dim, model_dim),
-            nn.GELU(),
-            nn.Linear(model_dim, patch_size * byte_dim),
-        )
-        self.out = nn.Linear(byte_dim, vocab_size)
+    def forward(self, memory: torch.Tensor) -> torch.Tensor:
+        """memory: (B, N, d_model) global hidden states (one per patch).
 
-    def forward(self, patch_states: torch.Tensor, target_len: Optional[int] = None) -> torch.Tensor:
-        """Args:
-
-        patch_states: [B, T_patches, model_dim]
-        target_len: optional integer length to slice the unrolled bytes.
-
-        Returns:
-            byte_logits: [B, T_bytes, vocab_size]
+        Returns byte logits (B, N * patch_size, 256), ordered by byte index.
         """
-        b, num_patches, _ = patch_states.shape
-        # [B, num_patches, patch_size, byte_dim]
-        x = self.proj(patch_states).view(b, num_patches * self.patch_size, self.byte_dim)
-        logits = self.out(x)  # [B, num_patches * patch_size, vocab_size]
+        B, N, _ = memory.shape
+        P = self.patch_size
+        z = self.latent_proj(memory)  # (B, N, byte_dim)
 
-        if target_len is not None:
-            logits = logits[:, :target_len, :]
+        x = (self.slot_query[None, :] + self.slot_pos.weight[None, :])  # (1, P, bd)
+        x = x.expand(B, N, P, -1)
+        BN = B * N
+        xs = x.reshape(BN, P, self.byte_dim)
+        zs = z.reshape(BN, 1, self.byte_dim)
 
-        return logits
+        h = self.norm1(xs)
+        a, _, _ = self.self_attn(h, h, h)
+        xs = xs + self.drop(a)
+        h = self.norm2(xs)
+        c, _, _ = self.cross_attn(h, zs, zs)
+        xs = xs + self.drop(c)
+        xs = xs + self.drop(self.ffn(self.norm3(xs)))
+
+        logits = self.byte_head(xs)  # (BN, P, 256)
+        return logits.reshape(B, N * P, N_BYTES)

@@ -1,230 +1,200 @@
-"""Dataset and DataLoader pipelines for tokenized and token-free (BLT) experiments."""
+"""Data loading for the XOR-cipher decryption task.
 
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+The dataset pairs each plaintext line (Brown corpus sentences) with its
+ciphertext: every plaintext byte is XOR-ed with the repeating 8-byte ASCII
+key ``"ANLP2026"`` and expanded to an 8-character bit string.
+
+Two data paths (matching the ablation table):
+
+- C1-C4 ("standard subword"): both sides are tokenized with *learned BPE*
+  tokenizers (trained on the train split).  The ciphertext is a bit string,
+  so its BPE tokens are learned bit patterns (NOT fixed-width 8-bit chunks).
+- C5 (BLT, token-free): raw cipher bytes (0-255) and raw plaintext bytes are
+  used directly; no linguistic vocabulary.
+"""
+
+import os
+from typing import Dict, List, Tuple
+
 import torch
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader, Dataset, Subset, random_split
+from torch.utils.data import DataLoader, Dataset
+from tokenizers import Tokenizer, models, trainers
+
+# --- token ids ----------------------------------------------------------------
+PAD, UNK, BOS, EOS = "<pad>", "<unk>", "<s>", "</s>"
+SPECIALS = [PAD, UNK, BOS, EOS]
+PAD_ID, UNK_ID, BOS_ID, EOS_ID = 0, 1, 2, 3
+BYTE_PAD = 256  # padding id for raw-byte (BLT) sequences
+CIPHER_KEY = b"ANLP2026"
 
 
-def pack_bitstring(text: str) -> str:
-    """If text is a binary string composed solely of '0' and '1' and divisible by 8, pack to bytes/chars."""
-    if len(text) >= 8 and len(text) % 8 == 0 and all(c in "01" for c in text):
-        return "".join(chr(int(text[i : i + 8], 2)) for i in range(0, len(text), 8))
-    return text
+# --- raw data ------------------------------------------------------------------
+def xor_decrypt(plain_bytes: bytes, key: bytes = CIPHER_KEY) -> bytes:
+    """C[i] = P[i] XOR K[i mod len(key)]."""
+    return bytes(p ^ key[i % len(key)] for i, p in enumerate(plain_bytes))
 
 
-from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+def load_pairs(cipher_path: str, plain_path: str, verify: bool = True
+               ) -> List[Tuple[str, str]]:
+    """Load (cipher_bit_string, plain_text) line pairs; verify the XOR mapping."""
+    plain_lines = open(plain_path, "rb").read().decode("latin1").splitlines()
+    cipher_lines = open(cipher_path, "rb").read().decode("latin1").splitlines()
+    assert len(plain_lines) == len(cipher_lines), "line count mismatch"
+    pairs: List[Tuple[str, str]] = []
+    for i, (p, c) in enumerate(zip(plain_lines, cipher_lines)):
+        if verify:
+            assert len(c) == 8 * len(p), f"line {i}: cipher length mismatch"
+            cb = bytes(int(c[j * 8 : j * 8 + 8], 2) for j in range(len(p)))
+            expected = xor_decrypt(p.encode("latin1"))
+            assert cb == expected, f"line {i}: XOR mapping does not hold"
+        pairs.append((c, p))
+    return pairs
 
-class SubwordTokenizer:
-    """Subword-level tokenizer using ByteLevel BPE with special tokens."""
 
-    pad_id: int = 0
-    bos_id: int = 1
-    eos_id: int = 2
-    unk_id: int = 3
+def cipher_bytes_of(cipher_bits: str) -> bytes:
+    """Cipher bit string -> cipher bytes."""
+    return bytes(int(cipher_bits[i * 8 : i * 8 + 8], 2)
+                 for i in range(len(cipher_bits) // 8))
 
-    def __init__(self, texts: Optional[List[str]] = None, vocab_size: int = 8000):
-        self.tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
-        self.tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-        self.tokenizer.decoder = decoders.ByteLevel()
-        if texts is not None:
-            packed_texts = [pack_bitstring(t) for t in texts]
-            trainer = trainers.BpeTrainer(
-                vocab_size=vocab_size,
-                special_tokens=["<pad>", "<bos>", "<eos>", "<unk>"],
-                initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
-            )
-            self.tokenizer.train_from_iterator(packed_texts, trainer)
 
-    def __len__(self) -> int:
-        return self.tokenizer.get_vocab_size()
+# --- BPE tokenizer ---------------------------------------------------------------
+class BPETextTokenizer:
+    """Learned BPE subword tokenizer (HuggingFace `tokenizers`)."""
 
-    def save(self, path: Union[str, Path]) -> None:
-        """Save the tokenizer model to a JSON file."""
-        self.tokenizer.save(str(path))
+    def __init__(self, path: str = None):
+        self.path = path
+        if path is not None:
+            self.tok = Tokenizer.from_file(path)
+        else:
+            self.tok = Tokenizer(models.BPE())
 
     @classmethod
-    def from_file(cls, path: Union[str, Path]) -> "SubwordTokenizer":
-        """Load tokenizer from a saved JSON file."""
-        instance = cls()
-        instance.tokenizer = Tokenizer.from_file(str(path))
-        return instance
+    def train(cls, texts, vocab_size: int, save_dir: str, name: str
+              ) -> "BPETextTokenizer":
+        tok = Tokenizer(models.BPE())
+        trainer = trainers.BpeTrainer(
+            vocab_size=vocab_size,
+            min_frequency=2,
+            special_tokens=SPECIALS,
+        )
+        tok.train_from_iterator(iter(texts), trainer=trainer)
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, f"{name}.json")
+        tok.save(path)
+        return cls(path)
 
-    def encode(self, text: str, add_special_tokens: bool = True) -> torch.Tensor:
-        packed = pack_bitstring(text)
-        ids = self.tokenizer.encode(packed).ids
-        if add_special_tokens:
-            ids = [self.bos_id] + ids + [self.eos_id]
-        return torch.tensor(ids, dtype=torch.long)
+    @property
+    def vocab_size(self) -> int:
+        return self.tok.get_vocab_size()
 
-    def decode(self, ids: Union[torch.Tensor, List[int]], remove_special_tokens: bool = True) -> str:
-        if isinstance(ids, torch.Tensor):
-            ids = ids.tolist()
-        return self.tokenizer.decode(ids, skip_special_tokens=remove_special_tokens)
+    def encode(self, text: str) -> List[int]:
+        return self.tok.encode(text).ids
 
-
-class ByteTokenizer:
-    """Token-free representation: raw UTF-8 bytes with special tokens."""
-
-    pad_id: int = 256
-    bos_id: int = 257
-    eos_id: int = 258
-    unk_id: int = 259
-    vocab_size: int = 260
-
-    def __init__(self, auto_pack_bits: bool = True):
-        self.auto_pack_bits = auto_pack_bits
-
-    def __len__(self) -> int:
-        return self.vocab_size
-
-    def encode(self, text: str, add_special_tokens: bool = True) -> torch.Tensor:
-        if self.auto_pack_bits and len(text) >= 8 and len(text) % 8 == 0 and all(c in "01" for c in text):
-            raw_bytes = [int(text[i : i + 8], 2) for i in range(0, len(text), 8)]
-        else:
-            raw_bytes = list(text.encode("utf-8"))
-
-        if add_special_tokens:
-            raw_bytes = [self.bos_id] + raw_bytes + [self.eos_id]
-        return torch.tensor(raw_bytes, dtype=torch.long)
-
-    def decode(self, ids: Union[torch.Tensor, List[int]], remove_special_tokens: bool = True) -> str:
-        if isinstance(ids, torch.Tensor):
-            ids = ids.tolist()
-        special = {self.pad_id, self.bos_id, self.eos_id, self.unk_id} if remove_special_tokens else set()
-        byte_list = [int(i) for i in ids if int(i) not in special and 0 <= int(i) <= 255]
-        return bytes(byte_list).decode("utf-8", errors="replace")
+    def decode(self, ids) -> str:
+        ids = [i for i in ids if i not in (PAD_ID, UNK_ID, BOS_ID, EOS_ID)]
+        return self.tok.decode(list(ids))
 
 
-class ParallelTextDataset(Dataset):
-    """Aligned Cipher -> Plaintext parallel dataset."""
+# --- datasets -----------------------------------------------------------------------
+class TokenizedCipherDataset(Dataset):
+    """C1-C4: BPE token ids.  src = cipher BPE ids, tgt = BOS + plain BPE + EOS.
 
-    def __init__(
-        self,
-        cipher_path: str,
-        plain_path: str,
-        tokenizer: object,
-        max_src_len: int = 4096,
-        max_tgt_len: int = 1024,
-    ):
-        if tokenizer is None:
-            raise ValueError("A fitted tokenizer must be passed to ParallelTextDataset to prevent data leakage. "
-                             "Use make_dataloaders() which handles dataset splitting before tokenizer training.")
-        self.cipher = Path(cipher_path).read_text(encoding="utf-8").splitlines()
-        self.plain = Path(plain_path).read_text(encoding="utf-8").splitlines()
-        if len(self.cipher) != len(self.plain):
-            raise ValueError(f"Length mismatch: {len(self.cipher)} cipher vs {len(self.plain)} plain")
+    Each item stores (src_ids, tgt_ids, ref_text) so references stay aligned
+    with length filtering.
+    """
 
-        self.tokenizer = tokenizer
-        self.max_src_len = max_src_len
-        self.max_tgt_len = max_tgt_len
+    def __init__(self, pairs, cipher_tok: BPETextTokenizer,
+                 plain_tok: BPETextTokenizer, max_src_len: int, max_tgt_len: int):
+        self.items: List[Tuple[List[int], List[int], str]] = []
+        for c, p in pairs:
+            s = cipher_tok.encode(c)
+            t = plain_tok.encode(p)
+            if len(s) <= max_src_len and len(t) + 2 <= max_tgt_len:
+                self.items.append((s, [BOS_ID] + t + [EOS_ID], p))
 
-    def __len__(self) -> int:
-        return len(self.cipher)
+    def __len__(self):
+        return len(self.items)
 
-    def __getitem__(self, index: int) -> Dict[str, object]:
-        src_text = self.cipher[index]
-        tgt_text = self.plain[index]
+    def __getitem__(self, i):
+        s, t, _ = self.items[i]
+        return {"src": torch.tensor(s, dtype=torch.long),
+                "tgt": torch.tensor(t, dtype=torch.long)}
 
-        src_ids = self.tokenizer.encode(src_text)
-        tgt_ids = self.tokenizer.encode(tgt_text)
-
-        if len(src_ids) > self.max_src_len:
-            src_ids = torch.cat([src_ids[: self.max_src_len - 1], src_ids[-1:]])
-        if len(tgt_ids) > self.max_tgt_len:
-            tgt_ids = torch.cat([tgt_ids[: self.max_tgt_len - 1], tgt_ids[-1:]])
-
-        return {
-            "source": src_ids,
-            "target": tgt_ids,
-            "source_text": src_text,
-            "target_text": tgt_text,
-        }
+    def refs(self) -> List[str]:
+        return [item[2] for item in self.items]
 
 
-def collate_batch(batch: List[Dict[str, object]], pad_id: int = 0) -> Dict[str, object]:
-    source = pad_sequence([x["source"] for x in batch], batch_first=True, padding_value=pad_id)
-    target = pad_sequence([x["target"] for x in batch], batch_first=True, padding_value=pad_id)
+class ByteCipherDataset(Dataset):
+    """C5 (BLT): raw bytes.  src = cipher bytes, tgt = plaintext bytes (1:1)."""
 
+    def __init__(self, pairs, max_len: int):
+        self.items: List[Tuple[List[int], List[int], str]] = []
+        for c, p in pairs:
+            cb = cipher_bytes_of(c)
+            if len(cb) <= max_len:
+                self.items.append((list(cb), [ord(ch) for ch in p], p))
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        s, t, _ = self.items[i]
+        return {"src": torch.tensor(s, dtype=torch.long),
+                "tgt": torch.tensor(t, dtype=torch.long)}
+
+    def refs(self) -> List[str]:
+        return [item[2] for item in self.items]
+
+
+# --- collate / loaders ------------------------------------------------------------------
+def collate_tokenized(batch):
+    src = pad_sequence([b["src"] for b in batch], batch_first=True, padding_value=PAD_ID)
+    tgt = pad_sequence([b["tgt"] for b in batch], batch_first=True, padding_value=PAD_ID)
     return {
-        "source": source,
-        "target": target,
-        # True = valid token, False = padding token (matches SDPA boolean mask convention)
-        "source_mask": source.ne(pad_id),
-        "target_mask": target.ne(pad_id),
-        "source_text": [x["source_text"] for x in batch],
-        "target_text": [x["target_text"] for x in batch],
+        "src": src,
+        "src_mask": src != PAD_ID,
+        "tgt": tgt,
+        "tgt_mask": tgt != PAD_ID,
     }
 
 
-def make_dataloaders(
-    cipher_path: str,
-    plain_path: str,
-    tokenizer: Optional[object] = None,
-    batch_size: int = 16,
-    max_src_len: int = 4096,
-    max_tgt_len: int = 1024,
-    vocab_size: int = 8000,
-    split_ratios: Tuple[float, float, float] = (0.8, 0.1, 0.1),
-    num_workers: int = 0,
-) -> Tuple[DataLoader, DataLoader, DataLoader, object]:
-    raw_cipher = Path(cipher_path).read_text(encoding="utf-8").splitlines()
-    raw_plain = Path(plain_path).read_text(encoding="utf-8").splitlines()
-    if len(raw_cipher) != len(raw_plain):
-        raise ValueError(f"Length mismatch: {len(raw_cipher)} cipher vs {len(raw_plain)} plain")
+def collate_bytes(batch):
+    src = pad_sequence([b["src"] for b in batch], batch_first=True, padding_value=BYTE_PAD)
+    tgt = pad_sequence([b["tgt"] for b in batch], batch_first=True, padding_value=BYTE_PAD)
+    return {
+        "src": src,
+        "src_mask": src != BYTE_PAD,
+        "tgt": tgt,
+        "lengths": torch.tensor([len(b["src"]) for b in batch], dtype=torch.long),
+    }
 
-    n = len(raw_cipher)
-    train_n = int(split_ratios[0] * n)
-    val_n = int(split_ratios[1] * n)
-    test_n = n - train_n - val_n
 
-    gen = torch.Generator().manual_seed(42)
-    indices = torch.randperm(n, generator=gen).tolist()
-    train_indices = indices[:train_n]
-    val_indices = indices[train_n : train_n + val_n]
-    test_indices = indices[train_n + val_n :]
+def make_dataloaders(split_pairs: Dict[str, list], args, tokenizers=None
+                     ) -> Dict[str, DataLoader]:
+    """split_pairs: {"train": [...], "val": [...], "test": [...]}.
 
-    if tokenizer is None:
-        # Fit tokenizer ONLY on the train split to prevent data leakage
-        train_cipher = [raw_cipher[i] for i in train_indices]
-        train_plain = [raw_plain[i] for i in train_indices]
-        tokenizer = SubwordTokenizer(train_cipher + train_plain, vocab_size=vocab_size)
-
-    dataset = ParallelTextDataset(
-        cipher_path,
-        plain_path,
-        tokenizer=tokenizer,
-        max_src_len=max_src_len,
-        max_tgt_len=max_tgt_len,
-    )
-
-    train_set = Subset(dataset, train_indices)
-    val_set = Subset(dataset, val_indices)
-    test_set = Subset(dataset, test_indices)
-
-    pad_id = getattr(tokenizer, "pad_id", 0)
-
-    train_loader = DataLoader(
-        train_set,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=lambda b: collate_batch(b, pad_id=pad_id),
-        num_workers=num_workers,
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=lambda b: collate_batch(b, pad_id=pad_id),
-        num_workers=num_workers,
-    )
-    test_loader = DataLoader(
-        test_set,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=lambda b: collate_batch(b, pad_id=pad_id),
-        num_workers=num_workers,
-    )
-
-    return train_loader, val_loader, test_loader, tokenizer
+    tokenizers=None -> raw-byte (BLT) datasets for C5.
+    """
+    cipher_tok, plain_tok = (None, None) if tokenizers is None else tokenizers
+    loaders = {}
+    collate = collate_bytes if tokenizers is None else collate_tokenized
+    for name in ("train", "val", "test"):
+        pairs = split_pairs[name]
+        if tokenizers is None:
+            d = ByteCipherDataset(pairs, max_len=args.max_src_len)
+        else:
+            d = TokenizedCipherDataset(
+                pairs, cipher_tok, plain_tok,
+                max_src_len=args.max_src_len, max_tgt_len=args.max_tgt_len,
+            )
+        loaders[name] = DataLoader(
+            d,
+            batch_size=args.batch_size if name == "train" else args.eval_batch_size,
+            shuffle=(name == "train"),
+            num_workers=args.num_workers,
+            collate_fn=collate,
+            drop_last=(name == "train" and args.drop_last),
+            persistent_workers=args.num_workers > 0,
+        )
+    return loaders

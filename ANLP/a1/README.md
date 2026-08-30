@@ -1,99 +1,112 @@
-# Assignment 1: Custom Transformers, Architectural Variants, and Byte Latent Transformers (BLT)
-**Course:** Advanced Natural Language Processing (Spring 2026)
+# ANLP M26 — Assignment 1: Transformer Ablation Study (from scratch)
 
----
+Learned decryption of a repeating-key XOR cipher: a Seq2Seq Transformer built
+**from scratch** (no `nn.Transformer` / `nn.MultiheadAttention`) maps the
+bit-string ciphertext in `data/brown_cipher.txt` to the plaintext in
+`data/brown_plain.txt`.
 
-## 1. Project Overview
+The cipher is `C[i] = P[i] XOR K[i mod 8]` with key `"ANLP2026"` (verified on
+all 5000 lines). The theoretical optimum is 100% bit/sequence accuracy, so the
+test set is a pure model-quality probe.
 
-This repository contains a full Seq2Seq Transformer built **from scratch using basic PyTorch operations** (without `nn.Transformer` or `nn.MultiheadAttention`) to learn mappings from encrypted binary cipher sequences (`brown_cipher.txt`) to plaintext English sentences (`brown_plain.txt`).
+## Ablation configs
 
-It includes implementations of 5 controlled ablation configurations:
-- **C1 (Base)**: Sinusoidal Absolute Positional Encoding + Multi-Head Attention (MHA) + Pre-LayerNorm + Subword BPE (8k vocab).
-- **C2 (RoPE)**: Rotary Positional Embedding (RoPE) + Multi-Head Attention (MHA) + Pre-LayerNorm + Subword BPE (8k vocab).
-- **C3 (GQA)**: Sinusoidal Absolute Positional Encoding + Grouped-Query Attention (GQA, `kv_heads=4`) + Pre-LayerNorm + Subword BPE (8k vocab).
-- **C4 (RMSNorm)**: Sinusoidal Absolute Positional Encoding + Multi-Head Attention (MHA) + RMSNorm + Subword BPE (8k vocab).
-- **C5 (BLT Token-Free)**: Sinusoidal Absolute Positional Encoding + Multi-Head Attention (MHA) + Pre-LayerNorm + Byte Latent Transformer (Local Encoder/Decoder).
+| Config | Positional encoding | Attention   | Normalization | Tokenization            |
+|--------|--------------------|-------------|---------------|-------------------------|
+| C1     | Sinusoidal         | MHA         | LayerNorm     | BPE subword (8k vocab)  |
+| C2     | RoPE               | MHA         | LayerNorm     | BPE subword (8k vocab)  |
+| C3     | Sinusoidal         | GQA (kv=4)  | LayerNorm     | BPE subword (8k vocab)  |
+| C4     | Sinusoidal         | MHA         | RMSNorm       | BPE subword (8k vocab)  |
+| C5     | Sinusoidal         | MHA         | LayerNorm     | BLT token-free (raw bytes, patch 4) |
 
-For an in-depth technical analysis of the XOR cipher, the English prior failure mode, and empirical results, refer to [EXPERIMENT_GUIDE.md](EXPERIMENT_GUIDE.md).
+Shared: `dim=256, heads=8, layers=4, dim_ff=1024, dropout=0.1, lr=5e-4
+(warmup 250 + cosine to 1e-5), AdamW (wd 0.01), grad clip 1.0, effective
+batch 16 (8 x 2 accumulation), 15 epochs, max_src 1024, max_tgt 512, seed 42`.
 
----
+BPE tokenizers (one for cipher bit-strings, one for plaintext) are **learned
+subword** tokenizers trained on the train split only (8:1:1 split). The
+ciphertext is tokenized over its raw bit characters — learned merges, *not*
+fixed 8-bit chunks.
 
-## 2. Directory Structure
+## Repository layout
 
 ```
-<rollnumber>_assignment1/
 |-- src/
 |   |-- models/
-|   |   |-- attention.py     # SDPA, MHA, GQA, and FFN modules from scratch
-|   |   |-- positional.py    # Sinusoidal PE and RoPE modules from scratch
-|   |   |-- norm.py          # Custom LayerNorm and RMSNorm modules from scratch
-|   |   `-- blt.py           # Local Encoder and Local Decoder for BLT
-|   |-- dataset.py           # SubwordTokenizer (BPE 8k) & ByteTokenizer DataLoaders
-|   |-- train.py             # Main training, evaluation, AMP, DataParallel & WandB loop
-|   `-- utils.py             # Metrics (Bit Acc, Seq Acc, Levenshtein, BLEU, ROUGE) & Greedy Decode
+|   |   |-- attention.py   # SDPA, MHA, GQA, FFN, encoder/decoder blocks
+|   |   |-- blt.py         # BLT local byte encoder/decoder (C5)
+|   |   |-- norm.py        # LayerNorm, RMSNorm (from scratch)
+|   |   |-- positional.py  # Sinusoidal PE, RoPE (from scratch)
+|   |   `-- transformer.py # Seq2SeqTransformer (C1-C4), BLTModel (C5)
+|   |-- dataset.py         # BPE tokenizers, tokenized & byte loaders
+|   |-- train.py           # Main training loop with WandB
+|   `-- utils.py           # Metrics (bit acc, seq acc, Levenshtein, BLEU, ROUGE-L) + plots
 |-- scripts/
-|   |-- run_experiment.sh    # SLURM experiment runner
-|   `-- submit_all.sh        # Batch job submission for C1-C5
-|-- outputs/                 # Checkpoints, logs, and evaluation outputs
-|-- data/                    # brown_cipher.txt & brown_plain.txt
-|-- EXPERIMENT_GUIDE.md      # Comprehensive post-mortem & experimental guide
-`-- README.md                # Setup instructions, documentation & links
+|   |-- run_experiment.sh  # SLURM job script (any config)
+|   |-- submit_all.sh      # Submit C1..C5
+|   `-- setup_cluster.sh   # One-time .venv_cluster setup
+|-- data/                  # brown_cipher.txt, brown_plain.txt
+|-- outputs/               # Per-config results, checkpoints, plots, tokenizers
+`-- Report.pdf             # Final report
 ```
 
----
+## Setup
 
-## 3. Setup and Installation
-
-### Prerequisites
-- Python >= 3.10 (tested on Python 3.14)
-- [uv](https://github.com/astral-sh/uv) or standard `pip`
-
-### Install Dependencies
 ```bash
-# Using uv:
-uv sync
-
-# Or using pip:
-pip install torch numpy tokenizers wandb
+uv sync                      # creates .venv with torch + deps
+# or manually:
+pip install torch tokenizers numpy matplotlib wandb huggingface_hub
 ```
 
----
+## Running
 
-## 4. Running Experiments
+Quick smoke test (256-sample subset, 2 epochs, ~1 min per config):
 
-### On SLURM Cluster:
 ```bash
-# Submit all 5 configurations
-bash scripts/submit_all.sh
-
-# Or submit individual configuration:
-sbatch --job-name=anlp_C1 --gres=gpu:2 scripts/run_experiment.sh C1 15 16 5e-4 256 8 4 1024 512 4 64 8000 1
+python src/train.py --config C1 --quick
 ```
 
-### Locally:
+Full single config (WandB logging + HF upload):
+
 ```bash
-# Configuration 1: Base Transformer
-uv run python src/train.py --config C1 --epochs 15 --batch-size 16 --lr 5e-4 --dim 256 --heads 8 --layers 4 --max-src-len 1024 --max-tgt-len 512 --vocab-size 8000 --wandb
-
-# Configuration 2: Rotary Positional Encodings (RoPE)
-uv run python src/train.py --config C2 --epochs 15 --batch-size 16 --lr 5e-4 --dim 256 --heads 8 --layers 4 --max-src-len 1024 --max-tgt-len 512 --vocab-size 8000 --wandb
-
-# Configuration 3: Grouped-Query Attention (GQA)
-uv run python src/train.py --config C3 --epochs 15 --batch-size 16 --lr 5e-4 --dim 256 --heads 8 --layers 4 --max-src-len 1024 --max-tgt-len 512 --vocab-size 8000 --wandb
-
-# Configuration 4: RMSNorm Normalization
-uv run python src/train.py --config C4 --epochs 15 --batch-size 16 --lr 5e-4 --dim 256 --heads 8 --layers 4 --max-src-len 1024 --max-tgt-len 512 --vocab-size 8000 --wandb
-
-# Configuration 5: Byte Latent Transformer (BLT Token-Free)
-uv run python src/train.py --config C5 --epochs 15 --batch-size 16 --lr 5e-4 --dim 256 --heads 8 --layers 4 --max-src-len 1024 --max-tgt-len 512 --patch-size 4 --byte-dim 64 --wandb
+WANDB_API_KEY=... HF_TOKEN=... \
+python src/train.py --config C1 --wandb --hf-repo <user>/anlp-a1-c1
 ```
 
----
+SLURM (cluster):
 
-## 5. Evaluation Metrics
+```bash
+bash scripts/setup_cluster.sh        # once, on a node
+bash scripts/submit_all.sh           # submits C1..C5 (15 epochs each)
+# single config: sbatch --job-name=anlp_C2 scripts/run_experiment.sh C2
+# with HF upload:  HF_REPO=<user>/anlp-a1-c2 sbatch ... scripts/run_experiment.sh C2
+```
 
-During validation and testing, the model evaluates greedy autoregressive decoding on:
-- **Bit-Level Accuracy**: Percentage of exact bit matches between decoded text and ground truth UTF-8 binary representations.
-- **Sequence Accuracy**: Percentage of sentences reconstructed with 100% exact match.
-- **Levenshtein Distance**: Minimum edit distance between predictions and ground truth.
-- **BLEU & ROUGE-L Scores**: Standard n-gram overlap and longest common subsequence overlap metrics.
+Notes:
+- Mixed precision is selected automatically: **bf16** on Ampere+ GPUs,
+  **fp16 + GradScaler** on older ones (e.g. RTX 2080 Ti, compute cap 7.5).
+- Batch 8 x 2 accumulation = effective 16, the same effective batch the
+  reference setup uses; bump `--batch-size`/`--eval-batch-size` on bigger
+  GPUs for throughput (results unchanged).
+- Expected runtime: ~30–60 min per config on a 2080 Ti; C5 (BLT) is much
+  faster (single-pass non-autoregressive decode).
+- C5 skips BLEU/ROUGE by design (token-free; the assignment restricts those
+  metrics to the tokenized models C1-C4).
+
+## Outputs (per config, in `outputs/<C>/`)
+
+- `results.json` — final test metrics + full training history
+- `model_best.pt` / `model_last.pt` — checkpoints (best by val loss)
+- `training_curves.png` — loss / bit acc / seq acc / Levenshtein / BLEU / ROUGE-L
+- `test_samples.txt`, `val_samples_epoch1.txt` — reference/prediction samples
+- `config.json`, `tokenizers/` — exact config + learned BPE tokenizers
+
+Metrics: bit accuracy (byte-aligned, shorter predictions zero-padded to the
+reference length), sequence accuracy (exact match), mean Levenshtein distance,
+corpus BLEU with brevity penalty and mean sentence ROUGE-L F1 (char n-grams,
+C1-C4 only). All metrics are greedy-decoded.
+
+## Results
+
+*(filled in after training runs — WandB run URLs and HuggingFace checkpoint
+links go here and in the report.)*
