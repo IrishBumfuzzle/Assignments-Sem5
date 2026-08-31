@@ -171,17 +171,16 @@ def mean_rouge_l(refs: List[str], hyps: List[str]) -> float:
 
 
 # --- aggregate ---------------------------------------------------------------------------
-def compute_metrics(refs: List[str], hyps: List[str], tokenized: bool = True) -> dict:
-    m = {
+def compute_metrics(refs: List[str], hyps: List[str]) -> dict:
+    """All metrics for all configs.  BLEU / ROUGE-L are char n-gram metrics and
+    work on any text, so they are computed for C5 (token-free) as well."""
+    return {
         "bit_accuracy": bit_accuracy(hyps, refs),
         "sequence_accuracy": sequence_accuracy(hyps, refs),
         "levenshtein": mean_levenshtein(hyps, refs),
+        "bleu": corpus_bleu(refs, hyps),
+        "rouge_l": mean_rouge_l(refs, hyps),
     }
-    if tokenized:
-        # BLEU / ROUGE are reported for the tokenized configs (C1-C4).
-        m["bleu"] = corpus_bleu(refs, hyps)
-        m["rouge_l"] = mean_rouge_l(refs, hyps)
-    return m
 
 
 # --- plotting ------------------------------------------------------------------------------

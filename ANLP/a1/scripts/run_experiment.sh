@@ -12,7 +12,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$DIR" || exit 1
 
 CONFIG=${1:-C1}
-EPOCHS=${2:-15}
+EPOCHS=${2:-40}
 BATCH_SIZE=${3:-8}
 LR=${4:-5e-4}
 DIM=${5:-256}
@@ -61,6 +61,8 @@ if [ -n "$HF_REPO" ]; then
     echo "HuggingFace upload enabled: $HF_REPO"
 fi
 
+# NOTE: for C1-C4 byte targets, --max-tgt-len is auto-set by train.py to the
+# longest plaintext line + 2 (the MAX_TGT positional arg is ignored for them).
 python src/train.py \
     --config "$CONFIG" \
     --epochs "$EPOCHS" \

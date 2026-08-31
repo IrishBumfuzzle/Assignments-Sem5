@@ -1,0 +1,233 @@
+% ANLP M26 Assignment 1 - report skeleton
+% Fill prose sections yourself; tables/figures are pre-populated with
+% objective numbers from outputs/<C>/results.json.
+\documentclass[11pt]{article}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{graphicx,booktabs,amsmath,hyperref,enumitem}
+\usepackage{xcolor}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+
+\title{Ablation Study of Transformer Architectures for XOR-Cipher Decryption\\
+\large ANLP M26 -- Assignment 1}
+\author{<Your name> -- <Roll number>}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Task and approach}
+% TODO (you): 2-3 paragraphs. Describe the task (learned BPE over the
+% ciphertext bit string -> plaintext), the shared setup (dim 256, 8 heads,
+% 4 layers, FFN 1024, dropout 0.1, lr 5e-4, effective batch 16, 40 epochs,
+% max source 1024 tokens), and the five configs C1-C5 (Table~\ref{tab:configs}).
+
+\begin{table}[h]
+\centering
+\caption{Ablation configurations (all else shared).}
+\label{tab:configs}
+\begin{tabular}{lllll}
+\toprule
+Config & Positional encoding & Attention & Normalization & Tokenization \\
+\midrule
+C1 Base     & Sinusoidal & MHA ($h{=}8$) & LayerNorm & BPE subword (8k) + byte target \\
+C2 RoPE     & RoPE       & MHA ($h{=}8$) & LayerNorm & BPE subword (8k) + byte target \\
+C3 GQA      & Sinusoidal & GQA ($h{=}8$, kv$=4$) & LayerNorm & BPE subword (8k) + byte target \\
+C4 RMSNorm  & Sinusoidal & MHA ($h{=}8$) & RMSNorm   & BPE subword (8k) + byte target \\
+C5 BLT      & Sinusoidal & MHA ($h{=}8$) & LayerNorm & Token-free raw bytes (patch 4) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Design decisions}
+% TODO (you): explain the two target-side/tokenization decisions and the
+% diagnostics that motivated them:
+%  (1) ciphertext BPE over raw cipher bytes (variable-length learned tokens,
+%      not fixed 8-bit chunks) - required by the assignment;
+%  (2) target side: why byte-level targets (position i <-> plain byte i)
+%      instead of a second BPE vocabulary - the cipher/plain BPE boundary
+%      alignment measurement (IoU 0.41) and the copy/constant-key control
+%      experiments showing that cross-segmentation alignment is the bottleneck
+%      for a 4-layer model;
+%  (3) phase-annotated byte alphabet for the ciphertext: each ciphertext byte
+%      is represented together with its key position (i mod 8, a deterministic
+%      function of the byte index), so decryption of a symbol is a per-symbol
+%      lookup b XOR K[p]; BPE is still learned over this 2048-symbol alphabet.
+%      Diagnostic numbers: plain BPE<->BPE collapses to the English prior
+%      (bit acc 0.668 after 40 epochs, baseline 0.662); byte target +
+%      phase-annotated alphabet reaches 0.795 bit acc by epoch 25 of a 25-
+%      epoch probe (raw-byte-BPE byte target: ~0.62 byte acc at epoch 25);
+%      final numbers in Table~\ref{tab:main}.
+%  (4) implementation notes worth one sentence each: activation
+%      checkpointing of the encoder/decoder layers during training
+%      (numerically identical; enables the ~2670-position byte targets on
+%      small GPUs); random batches instead of length-homogeneous (bucketed)
+%      batches - bucketing stalling alignment learning (bit acc ~0.67 at ep 6
+%      vs ~0.83 for random batches on identical data/schedule), because each
+%      bucketed optimizer step sees a single length band and the model never
+%      consolidates one alignment rule across lengths; and the evaluation
+%      alignment fix (references must be permuted to the loader's iteration
+%      order; per-batch loss is unaffected).
+%  (5) the teacher-forced / greedy gap (Section~\ref{sec:exposure}): three
+%      training-side mitigations (prefix dropout x2, scheduled sampling) were
+%      probed and all failed to lift greedy off ~0.66-0.68 while degrading
+%      teacher forcing, so the official runs use plain teacher forcing and
+%      the report documents the diagnosis + failed mitigations.
+
+\section{Autoregressive decoding: the teacher-forced / greedy gap}
+\label{sec:exposure}
+% TODO (you): this section is a key part of the story. The numbers below are
+% objective (30-line validation sweep + 15-epoch training probes, C1).
+% Points to make:
+%  (1) The byte-target model learns the mapping well under teacher forcing
+%      (Table~\ref{tab:tf_vs_greedy}, left) but under *greedy* decoding it
+%      stalls near the always-space baseline (0.662): after the first few
+%      bytes the model's own prefix is wrong and it never recovers, so the
+%      output degenerates to fluent-but-wrong English. This is exposure bias.
+%  (2) A controlled sweep (Table~\ref{tab:prefix_sweep}) isolates the cause:
+%      the model stays aligned only while the fed prefix is correct.
+%      With the oracle prefix the incremental decode matches teacher forcing
+%      (0.893 vs 0.898 -- the KV-cache/positional machinery is exact); each
+%      10\% of randomised prefix positions costs accuracy; with a fully
+%      random prefix the model is *below* the space baseline. Periodic
+%      re-anchoring to the oracle (resync every k bytes) recovers most of the
+%      gap for small k -- the model can decrypt, it cannot *maintain*
+%      alignment on its own.
+%  (3) Random prefix dropout (replace q of the fed prefix ids with random
+%      ids during training) does NOT fix it: it teaches the model to ignore
+%      *obviously wrong* (random) bytes, but the greedy failure comes from
+%      *plausible* wrong bytes. q=0.5 barely moves greedy and hurts
+%      teacher forcing; q=1.0 removes the bootstrap signal entirely and the
+%      model falls back to the English prior (Table~\ref{tab:fixes}).
+%  (4) The natural next distribution is the model's *own* output: scheduled
+%      sampling. Every --ss-every epochs we greedy-decode the whole training
+%      set with the current weights, cache the predicted prefixes, and, with a
+%      probability ramping 0 -> --ss-max-p over --ss-ramp epochs, feed each
+%      sample its own cached prefix as the decoder input while still
+%      supervising against the true target. The 15-epoch probe shows it also
+%      does not help: greedy stays at 0.664 (below the 0.68 baseline) while
+%      teacher-forced accuracy drops to 0.814 -- training against any
+%      corrupted fraction of the prefix makes the model distrust a *correct*
+%      prefix too, so the alignment signal is weakened without the model ever
+%      learning to re-locate the source position from a wrong prefix.
+%  (5) Conclusion: within the fixed architecture and the greedy-decoding
+%      evaluation, the exposure-bias gap is not closed by input-side
+%      corruption of any tested distribution (random bytes or the model's own
+%      output). The official runs therefore use plain teacher forcing (the
+%      best greedy, 0.68, and the best TF), and this section documents the
+%      diagnosis and the failed mitigations. (One-sided remark for the
+%      discussion: the gap would vanish with beam search / sampling +
+%      resampling or a non-autoregressive target, which the evaluation
+%      protocol does not allow.)
+
+\begin{table}[h]
+\centering
+\caption{C1 (byte target), 30-line validation sweep on the epoch-25
+checkpoint: what the decoder is fed as its prefix. Bit accuracy.}
+\label{tab:prefix_sweep}
+\begin{tabular}{lr}
+\toprule
+Decoder prefix & Bit acc. \\
+\midrule
+oracle (ground truth)                    & 0.893 \\
+10\% of prefix positions randomised      & 0.791 \\
+30\% randomised                          & 0.722 \\
+50\% randomised                          & 0.688 \\
+80\% randomised                          & 0.664 \\
+100\% randomised                         & 0.654 \\
+resync to oracle every 2 bytes           & 0.767 \\
+resync to oracle every 5 bytes           & 0.708 \\
+resync to oracle every 10 bytes          & 0.691 \\
+pure greedy (own prefix)                 & 0.676 \\
+always-space baseline                    & 0.662 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{C1, full lengths, 15-epoch probes: mitigations for the greedy gap.
+``TF'' = teacher-forced val bit acc at epoch 15; ``greedy'' = val greedy bit
+acc at epoch 15.}
+\label{tab:fixes}
+\begin{tabular}{lrrr}
+\toprule
+Training recipe & TF (ep15) & Greedy val (ep15) & Notes \\
+\midrule
+baseline (teacher forcing)     & ~0.87$^{\dagger}$ & ~0.68 & $^{\dagger}$ep17; greedy flat 0.676--0.683 ep5--25 \\
+random prefix dropout, q=0.5   & 0.774 & 0.679 & hurts TF, no greedy gain \\
+random prefix dropout, q=1.0   & 0.662 & 0.657 & collapses to the English prior \\
+scheduled sampling, $p$: 0$\to$0.5 & 0.814 & 0.664 & own greedy prefixes (cap 1024 B, --ss-every 4) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Setup}
+% TODO (you): data (5000 Brown sentences, 80/10/10 split, seed 42),
+% hardware/software (PyTorch 2.x, bf16 on Ampere+, fp16+scaler on Turing),
+% training details (AdamW, warmup 250, cosine to 1e-5, grad clip 1.0),
+% evaluation protocol (greedy decoding on 500 held-out test lines; teacher-
+% forced tracking per epoch for the long byte-target sequences, full greedy
+% every 4 epochs and on the final test pass; best checkpoint by val loss).
+% Link: WandB project <url>, HuggingFace repo <url>.
+
+\section{Results}
+
+\begin{table}[h]
+\centering
+\caption{Test-set results (greedy decoding, 500 lines). Bit accuracy:
+fraction of plaintext bits recovered; sequence accuracy: exact full-line
+match; Levenshtein: mean edit distance; BLEU/ROUGE-L: character n-gram
+overlap (computed for all configs; the assignment requires them for the
+tokenized configs). Baselines: always-space bit acc 0.662.}
+\label{tab:main}
+\begin{tabular}{lrrrrrr}
+\toprule
+Config & Bit acc. & Seq acc. & Levenshtein $\downarrow$ & BLEU & ROUGE-L & Best epoch \\
+\midrule
+C1 Base    & TODO & TODO & TODO & TODO & TODO & TODO \\
+C2 RoPE    & TODO & TODO & TODO & TODO & TODO & TODO \\
+C3 GQA     & TODO & TODO & TODO & TODO & TODO & TODO \\
+C4 RMSNorm & TODO & TODO & TODO & TODO & TODO & TODO \\
+C5 BLT     & TODO & TODO & TODO & TODO & TODO & TODO \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Training behaviour (train vs val loss at best epoch, overfitting gap).}
+\label{tab:train}
+\begin{tabular}{lrrrr}
+\toprule
+Config & Train loss & Val loss (best) & Gap & Val loss (final) \\
+\midrule
+C1 & TODO & TODO & TODO & TODO \\
+C2 & TODO & TODO & TODO & TODO \\
+C3 & TODO & TODO & TODO & TODO \\
+C4 & TODO & TODO & TODO & TODO \\
+C5 & TODO & TODO & TODO & TODO \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Discussion}
+% TODO (you): interpret the ablations:
+%  - which architectural changes (RoPE, GQA, RMSNorm) move the metrics and by
+%    how much, relative to the base config;
+%  - the token-free BLT baseline: why it reaches decryption at all (1:1
+%    byte alignment, phase directly from position) and where it loses to
+%    subword models (or vice versa);
+%  - failure modes observed: the English-prior collapse of the fully
+%    tokenized target (bit acc stuck at the 0.662 baseline, val NLL above the
+%    marginal prior after 40 epochs) and what the copy/constant-key controls
+%    show about where the 4-layer budget runs out (ordinal alignment over
+%    ~200-1000 positions);
+%  - limitations: single-seed run, greedy-only evaluation, byte targets are a
+%    target-side design choice (ciphertext tokenization stays learned BPE as
+%    required).
+
+\section{Reproducibility}
+% TODO (you): exact commands (scripts/run_experiment.sh), WandB + HF links,
+% contents of the submission zip, how to reload a checkpoint and evaluate.
+
+\end{document}

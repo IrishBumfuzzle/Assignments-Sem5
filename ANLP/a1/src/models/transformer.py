@@ -32,6 +32,15 @@ class TransformerConfig:
     max_len: int = 2048
     pos_encoding: str = "sinusoidal"   # "sinusoidal" | "rope" | "none"
     norm: str = "layernorm"            # "layernorm" | "rmsnorm"
+    # Training-time prefix dropout: with probability q, each decoder input
+    # position (except BOS) is replaced by a random token id.  Forces the
+    # model to align target position -> source token from the positional
+    # encoding rather than from the prefix content, which is essential for
+    # autoregressive decoding: without it the model only learns to *correct*
+    # a correct prefix (high teacher-forced accuracy) and collapses to the
+    # language prior once its own prefix drifts (greedy accuracy stalls at
+    # the all-space baseline).
+    prefix_dropout: float = 0.0
 
     def __post_init__(self):
         if self.n_kv_heads is None:
@@ -78,7 +87,11 @@ class TransformerEncoder(nn.Module):
             if vocab_size is not None
             else None
         )
-        self.scale = math.sqrt(cfg.d_model)
+        # NOTE: no x sqrt(d_model) embedding scale.  With pre-LN blocks and
+        # sinusoidal PE, scaling embeddings by sqrt(d) makes the positional
+        # signal ~sqrt(d) times weaker than the token signal and drastically
+        # slows learning of position-sensitive mappings (verified on a
+        # synthetic copy task).  Modern pre-norm models omit the scale.
         self.pe = (
             SinusoidalPositionalEncoding(cfg.d_model, cfg.max_len)
             if cfg.pos_encoding == "sinusoidal"
@@ -103,14 +116,27 @@ class TransformerEncoder(nn.Module):
         if repr_input:
             h = x
         else:
-            h = self.embedding(x) * self.scale
+            h = self.embedding(x)
         if self.pe is not None:
             h = self.pe(h)
         L = h.size(1)
         attn_mask = mask.view(-1, 1, 1, L) if mask is not None else None
         pos = torch.arange(L, device=x.device)
+        # Activation checkpointing on the training path: trades ~30% compute
+        # for not saving the full T x T attention matrices of every layer
+        # (necessary for long byte-target sequences on small GPUs).
+        use_ckpt = torch.is_grad_enabled() and h.requires_grad
         for layer in self.layers:
-            h, _ = layer(h, mask=attn_mask, pos=pos)
+            if use_ckpt:
+                # NOTE: layer/mask/pos are bound via default args — a bare
+                # closure over the loop variable would late-bind and recompute
+                # the *last* layer in every node during backward.
+                h, _ = torch.utils.checkpoint.checkpoint(
+                    lambda hh, lyr=layer, msk=attn_mask, p=pos:
+                        lyr(hh, mask=msk, pos=p),
+                    h, use_reentrant=False)
+            else:
+                h, _ = layer(h, mask=attn_mask, pos=pos)
         return self.final_norm(h)
 
 
@@ -122,13 +148,14 @@ class TransformerDecoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.embedding = nn.Embedding(vocab_size, cfg.d_model, padding_idx=pad_idx)
-        self.scale = math.sqrt(cfg.d_model)
         self.pe = (
             SinusoidalPositionalEncoding(cfg.d_model, cfg.max_len)
             if cfg.pos_encoding == "sinusoidal"
             else None
         )
         self.rope = cfg.make_rope()
+        self.prefix_dropout = cfg.prefix_dropout
+        self.vocab_size = vocab_size
         self.layers = nn.ModuleList(
             TransformerDecoderLayer(
                 cfg.d_model, cfg.n_heads, cfg.n_kv_heads, cfg.d_ff or None,
@@ -137,6 +164,24 @@ class TransformerDecoder(nn.Module):
             for _ in range(cfg.n_layers)
         )
         self.final_norm = cfg.norm_layer()(cfg.d_model)
+
+    def _maybe_prefix_drop(self, x: torch.Tensor) -> torch.Tensor:
+        """Training-only: replace a fraction of prefix token ids with random
+        ids so alignment cannot rely on the prefix content."""
+        q = self.prefix_dropout
+        if not (self.training and q > 0.0):
+            return x
+        L = x.size(1)
+        if L < 2:
+            return x
+        mask = torch.rand(L, device=x.device) < q
+        mask[0] = False  # keep BOS clean
+        if not mask.any():
+            return x
+        x = x.clone()
+        n = int(mask.sum().item())
+        x[:, mask] = torch.randint(0, self.vocab_size, (n,), device=x.device)
+        return x
 
     @staticmethod
     def causal_mask(Lq: int, Lk: int, device) -> torch.Tensor:
@@ -154,7 +199,9 @@ class TransformerDecoder(nn.Module):
         pos_start: int = 0,
     ):
         """x: (B, L) token ids.  Returns (h (B, L, D), caches)."""
-        h = self.embedding(x) * self.scale
+        if cache is None:
+            x = self._maybe_prefix_drop(x)
+        h = self.embedding(x)
         L = h.size(1)
         if self.pe is not None:
             h = self.pe(h, offset=pos_start)
@@ -172,14 +219,28 @@ class TransformerDecoder(nn.Module):
         )
         pos = torch.arange(pos_start, pos_start + L, device=x.device)
 
+        use_ckpt = cache is None and torch.is_grad_enabled() and h.requires_grad
         caches = []
         for i, layer in enumerate(self.layers):
-            h, layer_cache = layer(
-                h, memory,
-                self_mask=self_mask, memory_mask=mem_mask,
-                pos=pos,
-                kv_cache=cache[i] if cache is not None else None,
-            )
+            if use_ckpt:
+                # checkpointing (teacher-forced training path only; the
+                # incremental KV-cache path is not checkpointed).  Loop
+                # variables are bound via default args to avoid late binding:
+                # a bare closure would recompute the *last* layer in every
+                # node during backward.
+                h, layer_cache = torch.utils.checkpoint.checkpoint(
+                    lambda hh, lyr=layer, mem=memory, sm=self_mask,
+                           mm=mem_mask, p=pos:
+                        lyr(hh, mem, self_mask=sm, memory_mask=mm, pos=p,
+                            kv_cache=None),
+                    h, use_reentrant=False)
+            else:
+                h, layer_cache = layer(
+                    h, memory,
+                    self_mask=self_mask, memory_mask=mem_mask,
+                    pos=pos,
+                    kv_cache=cache[i] if cache is not None else None,
+                )
             caches.append(layer_cache)
         return self.final_norm(h), caches
 
@@ -188,22 +249,32 @@ class Seq2SeqTransformer(nn.Module):
     """Full encoder-decoder Transformer (configs C1-C4)."""
 
     def __init__(self, src_vocab: int, tgt_vocab: int, cfg: TransformerConfig,
-                 pad_idx: int, eos_idx: int):
+                 pad_idx: int, eos_idx: int, tgt_pad_idx: int = None):
+        """tgt_pad_idx: decoder-side pad id (differs from src pad for the
+        byte-target variant: src PAD=0, tgt BYTE_PAD=256)."""
         super().__init__()
         self.cfg = cfg
         self.encoder = TransformerEncoder(cfg, vocab_size=src_vocab, pad_idx=pad_idx)
-        self.decoder = TransformerDecoder(cfg, vocab_size=tgt_vocab, pad_idx=pad_idx)
+        self.decoder = TransformerDecoder(
+            cfg, vocab_size=tgt_vocab, pad_idx=(tgt_pad_idx if tgt_pad_idx is not None else pad_idx))
         self.out_proj = nn.Linear(cfg.d_model, tgt_vocab)
         self.eos_idx = eos_idx
 
     def forward(self, src: torch.Tensor, src_mask: torch.Tensor,
-                tgt: torch.Tensor) -> torch.Tensor:
+                tgt: torch.Tensor, dec_input: torch.Tensor = None) -> torch.Tensor:
         """Teacher-forced forward.  src: (B, S), tgt: (B, T) (incl. BOS/EOS).
+
+        dec_input: optional (B, T-1) decoder-side input.  Defaults to
+        ``tgt[:, :-1]`` (true teacher forcing).  Used by scheduled sampling,
+        which feeds the model's *own* predicted prefix instead of the true one
+        while still supervising against the true target.
 
         Returns logits (B, T-1, V) aligned with tgt[:, 1:].
         """
         memory = self.encoder(src, mask=src_mask)
-        h, _ = self.decoder(tgt[:, :-1], memory, memory_mask=src_mask)
+        if dec_input is None:
+            dec_input = tgt[:, :-1]
+        h, _ = self.decoder(dec_input, memory, memory_mask=src_mask)
         return self.out_proj(h)
 
     @torch.no_grad()
@@ -219,8 +290,22 @@ class Seq2SeqTransformer(nn.Module):
         memory = self.encoder(src, mask=src_mask)
         mem_mask = src_mask  # (B, S); decoder reshapes to (B,1,1,S)
 
+        # Pre-allocate the per-layer KV cache buffers (the 3-tuple cache
+        # format makes MultiHeadAttention write in place instead of
+        # torch.cat-ing a growing tensor every step, which is O(T^2) memory
+        # traffic for long sequences).
+        if src.is_cuda and torch.is_autocast_enabled("cuda"):
+            cache_dtype = torch.get_autocast_dtype("cuda")
+        else:
+            cache_dtype = next(self.parameters()).dtype
+        cache = []
+        for layer in self.decoder.layers:
+            attn = layer.self_attn
+            kbuf = torch.empty(B, attn.n_heads, max_len, attn.head_dim,
+                               device=device, dtype=cache_dtype)
+            cache.append((kbuf, torch.empty_like(kbuf), 0))
+
         cur = torch.full((B, 1), bos_idx, device=device, dtype=torch.long)
-        cache: Optional[List[torch.Tensor]] = None
         rows: List[torch.Tensor] = []
         for t in range(max_len):
             h, cache = self.decoder(cur, memory, memory_mask=mem_mask,
@@ -240,7 +325,7 @@ class Seq2SeqTransformer(nn.Module):
         out = []
         for i in range(B):
             e = eos_pos[eos_pos[:, 0] == i]
-            last = int(e[:, 1].max().item()) if len(e) else ids.size(1)
+            last = int(e[:, 1].min().item()) if len(e) else ids.size(1)
             out.append(ids[i, : last + 1])
         return torch.nn.utils.rnn.pad_sequence(out, batch_first=True, padding_value=self.eos_idx)
 

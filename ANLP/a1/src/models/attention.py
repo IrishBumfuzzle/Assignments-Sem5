@@ -131,11 +131,25 @@ class MultiHeadAttention(nn.Module):
         k_exp, v_exp = self._expand_kv(k, v)
         if kv_cache is None:
             k_out, v_out = k_exp, v_exp
+            cache = (k_out, v_out)
+        elif len(kv_cache) == 3:
+            # Pre-allocated buffer cache (k_buf, v_buf, write_pos): write the
+            # new rows in place and expose the grown prefix as a view.  Zero
+            # per-step allocation -- the growing-cache torch.cat below is
+            # O(L) memory traffic per step, which makes long greedy decodes
+            # O(T^2) in wall time.
+            ck, cv, wpos = kv_cache
+            ck[:, :, wpos:wpos + Lq].copy_(k_exp)
+            cv[:, :, wpos:wpos + Lq].copy_(v_exp)
+            new_len = wpos + Lq
+            k_out = ck[:, :, :new_len]
+            v_out = cv[:, :, :new_len]
+            cache = (ck, cv, new_len)
         else:
             ck, cv = kv_cache
             k_out = torch.cat([ck, k_exp], dim=2)
             v_out = torch.cat([cv, v_exp], dim=2)
-        cache = (k_out, v_out)
+            cache = (k_out, v_out)
 
         out, attn_w = self.attn(q, k_out, v_out, mask)
         out = out.transpose(1, 2).reshape(B, Lq, -1)

@@ -5,6 +5,10 @@
   operations instead of wrapping ``nn.LayerNorm``.
 - RMSNorm: normalizes by root-mean-square only (no centering, no bias),
   as popularized by the LLaMA line of models.
+
+Both compute their statistics in fp32 for numerical stability under fp16
+autocast (Turing GPUs such as the RTX 2080 Ti); the affine part runs in the
+input dtype.  Under fp32/bf16 training this is a numerical no-op.
 """
 
 from typing import Optional
@@ -29,18 +33,20 @@ class LayerNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (..., dim)
-        mean = x.mean(dim=-1, keepdim=True)
-        var = x.var(dim=-1, unbiased=False, keepdim=True)
-        x = (x - mean) / torch.sqrt(var + self.eps)
+        out_dtype = x.dtype
+        xf = x.float()
+        mean = xf.mean(dim=-1, keepdim=True)
+        var = xf.var(dim=-1, unbiased=False, keepdim=True)
+        x = (xf - mean) / torch.sqrt(var + self.eps)
         if self.weight is not None:
-            x = x * self.weight
+            x = x * self.weight.float()
             if self.bias is not None:
-                x = x + self.bias
-        return x
+                x = x + self.bias.float()
+        return x.to(out_dtype)
 
 
 class RMSNorm(nn.Module):
-    """Root-mean-square normalization: x / rms(x) * gamma (no centering)."""
+    """Root-mean-square normalization: x / rms(x) * gamma (no bias)."""
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -50,8 +56,12 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (..., dim)
-        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return self.weight * (x / rms)
+        out_dtype = x.dtype
+        xf = x.float()
+        rms = torch.sqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        x = xf / rms
+        x = x * self.weight.float()
+        return x.to(out_dtype)
 
 
 def make_norm(norm: str, dim: int, eps: float = 1e-5) -> nn.Module:
