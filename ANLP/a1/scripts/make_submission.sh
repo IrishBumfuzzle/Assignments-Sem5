@@ -28,6 +28,7 @@ for C in C1 C2 C3 C4 C5; do
 done
 
 cp README.md "$STAGE/" 2>/dev/null || true
+cp IMPLEMENTATION.md "$STAGE/" 2>/dev/null || true
 cp report/Report.tex "$STAGE/report/" 2>/dev/null || true
 if [ -f report/Report.pdf ]; then
   cp report/Report.pdf "$STAGE/Report.pdf"
@@ -35,6 +36,7 @@ else
   echo "warning: report/Report.pdf missing (compile the LaTeX first)"
 fi
 
-rm -f "${ROLL}_assignment1.zip"
-(cd "$STAGE" && zip -rq "../${ROLL}_assignment1.zip" .)
-echo "wrote ${ROLL}_assignment1.zip: $(du -h ${ROLL}_assignment1.zip | cut -f1)"
+ROOT="$(pwd)"
+rm -f "${ROOT}/${ROLL}_assignment1.zip"
+(cd "$STAGE" && zip -rq "${ROOT}/${ROLL}_assignment1.zip" .)
+echo "wrote ${ROOT}/${ROLL}_assignment1.zip: $(du -h ${ROOT}/${ROLL}_assignment1.zip | cut -f1)"

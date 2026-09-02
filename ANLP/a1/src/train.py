@@ -141,6 +141,8 @@ def parse_args():
     p.add_argument("--wandb-entity", type=str, default=None)
     p.add_argument("--hf-repo", type=str, default=None,
                    help="HuggingFace repo id, e.g. user/anlp-a1 (uploaded per config)")
+    p.add_argument("--hf-token", type=str, default=None,
+                   help="HuggingFace API write token (or set HF_TOKEN env var)")
     p.add_argument("--max-test-log-samples", type=int, default=10)
     # smoke testing
     p.add_argument("--quick", action="store_true",
@@ -441,29 +443,35 @@ def upload_to_hf(args, output_dir: str) -> str:
         print("[hf] huggingface_hub not installed - skipping upload "
               "(pip install huggingface_hub)")
         return ""
-    api = HfApi()
+    token = getattr(args, "hf_token", None) or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    api = HfApi(token=token)
     repo = args.hf_repo
     try:
-        api.create_repo(repo, exist_ok=True)
-    except Exception as e:  # token missing / offline
-        print(f"[hf] could not create repo {repo}: {e}")
+        api.create_repo(repo, token=token, exist_ok=True)
+        print(f"[hf] repo {repo} verified / created.")
+    except Exception as e:
+        print(f"[hf] could not create/verify repo {repo}: {e}")
         return ""
     files = []
-    for fn in ("model_best.pt", "model_last.pt", "config.json", "results.json"):
+    for fn in ("model_best.pt", "model_last.pt", "config.json", "results.json", "training_curves.png", "test_samples.txt"):
         p = os.path.join(output_dir, fn)
         if os.path.exists(p):
             files.append(p)
     tok_dir = os.path.join(output_dir, "tokenizers")
     if os.path.isdir(tok_dir):
-        files += [os.path.join(tok_dir, f) for f in os.listdir(tok_dir)]
+        files += [os.path.join(tok_dir, f) for f in os.listdir(tok_dir) if os.path.isfile(os.path.join(tok_dir, f))]
     for f in files:
-        url = api.upload_file(
-            path_or_fileobj=f,
-            path_in_repo=os.path.basename(f),
-            repo_id=repo,
-        )
-        print(f"[hf] uploaded {f} -> {url}")
-    return api.repo_url(repo)
+        try:
+            url = api.upload_file(
+                path_or_fileobj=f,
+                path_in_repo=os.path.basename(f),
+                repo_id=repo,
+                token=token,
+            )
+            print(f"[hf] uploaded {os.path.basename(f)} -> {url}")
+        except Exception as e:
+            print(f"[hf] error uploading {f}: {e}")
+    return f"https://huggingface.co/{repo}"
 
 
 # --------------------------------------------------------------------------- #

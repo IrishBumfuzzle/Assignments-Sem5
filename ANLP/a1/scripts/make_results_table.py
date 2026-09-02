@@ -16,9 +16,13 @@ NAMES = {
 def load(out_dir):
     out = {}
     for c in NAMES:
-        p = os.path.join(out_dir, c, "results.json")
-        if os.path.exists(p):
-            out[c] = json.load(open(p))
+        # Check both outputs/C1/results.json and outputs/C1/C1/results.json
+        p_nested = os.path.join(out_dir, c, c, "results.json")
+        p_top = os.path.join(out_dir, c, "results.json")
+        if os.path.exists(p_nested):
+            out[c] = json.load(open(p_nested))
+        elif os.path.exists(p_top):
+            out[c] = json.load(open(p_top))
     return out
 
 
@@ -33,26 +37,40 @@ def main():
     print("| Config | Bit acc | Seq acc | Levenshtein | BLEU | ROUGE-L | Best epoch |")
     print("|--------|---------|---------|-------------|------|---------|------------|")
     for c, d in data.items():
-        t = d["test"]
-        print(f"| {NAMES[c]} | {t['bit_accuracy']:.4f} | {t['sequence_accuracy']:.4f} "
-              f"| {t['levenshtein']:.1f} | {t['bleu']:.4f} | {t['rouge_l']:.4f} "
-              f"| {d['best_epoch']} |")
+        t = d.get("test", {})
+        bit_acc = t.get("bit_accuracy", 0.0)
+        seq_acc = t.get("sequence_accuracy", 0.0)
+        lev = t.get("levenshtein", 0.0)
+        bleu = t.get("bleu", 0.0)
+        rouge = t.get("rouge_l", 0.0)
+        best_ep = d.get("best_epoch", "-")
+        print(f"| {NAMES[c]} | {bit_acc:.4f} | {seq_acc:.4f} "
+              f"| {lev:.1f} | {bleu:.4f} | {rouge:.4f} "
+              f"| {best_ep} |")
 
     print("\n## LaTeX: Table 1 (main results)\n")
     for c, d in data.items():
-        t = d["test"]
-        print(f"{NAMES[c]} & {t['bit_accuracy']:.4f} & {t['sequence_accuracy']:.4f} "
-              f"& {t['levenshtein']:.1f} & {t['bleu']:.4f} & {t['rouge_l']:.4f} "
-              f"& {d['best_epoch']} \\\\")
+        t = d.get("test", {})
+        bit_acc = t.get("bit_accuracy", 0.0)
+        seq_acc = t.get("sequence_accuracy", 0.0)
+        lev = t.get("levenshtein", 0.0)
+        bleu = t.get("bleu", 0.0)
+        rouge = t.get("rouge_l", 0.0)
+        best_ep = d.get("best_epoch", "-")
+        print(f"{NAMES[c]} & {bit_acc:.4f} & {seq_acc:.4f} "
+              f"& {lev:.1f} & {bleu:.4f} & {rouge:.4f} "
+              f"& {best_ep} \\\\")
 
     print("\n## LaTeX: Table 2 (training behaviour)\n")
     for c, d in data.items():
-        h = d["history"]
-        be = d["best_epoch"] - 1
-        tl = h["train_loss"][be]
-        vl_best = h["val_loss"][be]
-        vl_final = h["val_loss"][-1]
-        print(f"{c} & {tl:.3f} & {vl_best:.3f} & {vl_best - tl:+.3f} & {vl_final:.3f} \\\\")
+        h = d.get("history", {})
+        best_ep = d.get("best_epoch", 1)
+        be = max(0, best_ep - 1)
+        if "train_loss" in h and "val_loss" in h and len(h["train_loss"]) > be and len(h["val_loss"]) > be:
+            tl = h["train_loss"][be]
+            vl_best = h["val_loss"][be]
+            vl_final = h["val_loss"][-1]
+            print(f"{c} & {tl:.3f} & {vl_best:.3f} & {vl_best - tl:+.3f} & {vl_final:.3f} \\\\")
 
 
 if __name__ == "__main__":

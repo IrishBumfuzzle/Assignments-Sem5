@@ -7,8 +7,14 @@
 #SBATCH --time=08:00:00
 #SBATCH --output=outputs/%x_%j.log
 
-# Location-independent: works from any clone of this repo.
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Location-independent: prioritize SLURM_SUBMIT_DIR, then cluster path, then script parent
+if [ -n "$SLURM_SUBMIT_DIR" ] && [ -d "$SLURM_SUBMIT_DIR/src" ]; then
+    DIR="$SLURM_SUBMIT_DIR"
+elif [ -d "/home2/ojas.k/ANLP_a1/src" ]; then
+    DIR="/home2/ojas.k/ANLP_a1"
+else
+    DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+fi
 cd "$DIR" || exit 1
 
 CONFIG=${1:-C1}
@@ -26,27 +32,44 @@ VOCAB_SIZE=${12:-8000}
 GRAD_ACCUM=${13:-2}
 KV_HEADS=${14:-4}
 
+if [ "$CONFIG" = "C5" ] && [ -z "$3" ]; then
+    BATCH_SIZE=16
+    GRAD_ACCUM=1
+fi
+
+mkdir -p outputs
+mkdir -p /scratch/$USER/tmp 2>/dev/null || true
+export TMPDIR=/scratch/$USER/tmp
+
+# Virtual env: prefer .venv_cluster (SLURM nodes), fall back to .venv
+if [ -f "$DIR/.venv_cluster/bin/python" ]; then
+    PY="$DIR/.venv_cluster/bin/python"
+    source "$DIR/.venv_cluster/bin/activate" 2>/dev/null || true
+elif [ -f "$DIR/.venv/bin/python" ]; then
+    PY="$DIR/.venv/bin/python"
+    source "$DIR/.venv/bin/activate" 2>/dev/null || true
+elif [ -f "/home2/ojas.k/ANLP_a1/.venv_cluster/bin/python" ]; then
+    PY="/home2/ojas.k/ANLP_a1/.venv_cluster/bin/python"
+    source "/home2/ojas.k/ANLP_a1/.venv_cluster/bin/activate" 2>/dev/null || true
+elif command -v python3 &>/dev/null; then
+    PY="python3"
+elif command -v python &>/dev/null; then
+    PY="python"
+else
+    echo "ERROR: no python env found in $DIR"; exit 1
+fi
+
 echo "=========================================="
 echo "Job Name: $SLURM_JOB_NAME"
 echo "Job ID:   $SLURM_JOB_ID"
 echo "Node:     $HOSTNAME"
 echo "Repo:     $DIR"
 echo "Start:    $(date)"
+echo "Python:   $PY ($($PY --version 2>&1))"
 echo "Config:   $CONFIG | Epochs: $EPOCHS | Batch: $BATCH_SIZE (x$GRAD_ACCUM accum) | LR: $LR | Dim: $DIM | Heads: $HEADS (kv: $KV_HEADS) | Layers: $LAYERS | MaxSrc: $MAX_SRC | MaxTgt: $MAX_TGT | Vocab: $VOCAB_SIZE"
 echo "=========================================="
 
 nvidia-smi || true
-mkdir -p /scratch/$USER/tmp 2>/dev/null || true
-export TMPDIR=/scratch/$USER/tmp
-
-# Virtual env: prefer .venv_cluster (SLURM nodes), fall back to .venv
-if [ -f ".venv_cluster/bin/activate" ]; then
-    source .venv_cluster/bin/activate
-elif [ -f ".venv/bin/activate" ]; then
-    source .venv/bin/activate
-else
-    echo "ERROR: no .venv_cluster or .venv found in $DIR"; exit 1
-fi
 
 export WANDB_API_KEY="${WANDB_API_KEY:-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}"
 export WANDB_ENTITY="${WANDB_ENTITY:-irishbumfuzzle-team}"
@@ -59,12 +82,13 @@ HF_ARGS=""
 if [ -n "$HF_REPO" ]; then
     HF_ARGS="--hf-repo $HF_REPO"
     echo "HuggingFace upload enabled: $HF_REPO"
+else
+    HF_ARGS="--hf-repo IrishBumfuzzle/anlp-a1-$CONFIG"
 fi
 
-# NOTE: for C1-C4 byte targets, --max-tgt-len is auto-set by train.py to the
-# longest plaintext line + 2 (the MAX_TGT positional arg is ignored for them).
-python src/train.py \
+$PY -u src/train.py \
     --config "$CONFIG" \
+    --run-name "$CONFIG" \
     --epochs "$EPOCHS" \
     --batch-size "$BATCH_SIZE" \
     --lr "$LR" \
@@ -80,7 +104,7 @@ python src/train.py \
     --byte-dim "$BYTE_DIM" \
     --wandb-project "$WANDB_PROJECT" \
     --wandb-entity "$WANDB_ENTITY" \
-    --output-dir outputs \
+    --output-dir "outputs/$CONFIG" \
     $HF_ARGS \
     --wandb
 

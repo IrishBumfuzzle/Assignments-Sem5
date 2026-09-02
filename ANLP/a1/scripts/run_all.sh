@@ -1,83 +1,99 @@
 #!/bin/bash
-# Run all 5 configurations sequentially on ONE standalone GPU machine
-# (target: RTX 2080 Ti, 11 GB, compute capability 7.5).
+#SBATCH --job-name=anlp_all
+#SBATCH --partition=u22
+#SBATCH --constraint=2080ti
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --time=08:00:00
+#SBATCH --output=outputs/%x_%A_%a.log
+#SBATCH --array=1-5%5
+
+# Run all 5 configurations in PARALLEL on SLURM or locally across GPUs.
 #
-#   * C1-C4: byte-level targets (T ~ 2672), batch 8 x grad-accum 2 = 16
-#            (the assignment's batch size). fp16 + GradScaler is selected
-#            automatically on cc < 8.0 (train.py:get_amp_settings).
-#   * C5 (BLT): non-autoregressive 1:1 byte mapping, batch 16 x 1 = 16.
+# Configurations:
+#   Task 1 -> C1 (Base: Sinusoidal PE, MHA, LayerNorm, Byte Targets)
+#   Task 2 -> C2 (RoPE: Rotary PE, MHA, LayerNorm, Byte Targets)
+#   Task 3 -> C3 (GQA: Sinusoidal PE, Grouped-Query Attn kv_heads=4, LayerNorm, Byte Targets)
+#   Task 4 -> C4 (RMSNorm: Sinusoidal PE, MHA, RMSNorm, Byte Targets)
+#   Task 5 -> C5 (BLT: Byte Latent Transformer, Token-Free Patching)
 #
-# Requires: python env (.venv_cluster or .venv) from scripts/setup_cluster.sh,
-#           data/brown_cipher.txt and data/brown_plain.txt,
-#           a wandb API key (exported below by default), and optionally
-#           HF_TOKEN (export it to upload checkpoints to HuggingFace when
-#           each run finishes; without it the runs still complete, uploads
-#           are skipped with a warning).
-#
-# Usage:   bash scripts/run_all.sh            # C1..C5, 40 epochs each
-#          EPOCHS=10 bash scripts/run_all.sh  # shorter runs
-#
-# Wall time on a 2080 Ti: roughly 2.5-3 h per C1-C4 config, ~1.5 h for C5.
+# Usage:
+#   sbatch scripts/run_all.sh          # Submits 5 parallel tasks on SLURM (Job Array)
+#   bash scripts/run_all.sh            # Submits 5 parallel SLURM jobs (or runs parallel locally)
+#   EPOCHS=10 bash scripts/run_all.sh  # Shorter test runs
 
 set -e
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Location-independent: prioritize SLURM_SUBMIT_DIR, then cluster path, then script parent
+if [ -n "$SLURM_SUBMIT_DIR" ] && [ -d "$SLURM_SUBMIT_DIR/src" ]; then
+    DIR="$SLURM_SUBMIT_DIR"
+elif [ -d "/home2/ojas.k/ANLP_a1/src" ]; then
+    DIR="/home2/ojas.k/ANLP_a1"
+else
+    DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+fi
 cd "$DIR" || exit 1
 
-# --- python env -------------------------------------------------------------
-if [ -f ".venv_cluster/bin/python" ]; then
-    PY=".venv_cluster/bin/python"
-elif [ -f ".venv/bin/python" ]; then
-    PY=".venv/bin/python"
-else
-    echo "ERROR: no python env found. Run: bash scripts/setup_cluster.sh"; exit 1
-fi
-echo "Using python: $PY ($($PY --version 2>&1))"
-
-# --- environment -------------------------------------------------------------
-export WANDB_API_KEY="${WANDB_API_KEY:-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}"
-export WANDB_ENTITY="${WANDB_ENTITY:-irishbumfuzzle-team}"
-export WANDB_PROJECT="${WANDB_PROJECT:-anlp-assignment1}"
-export PYTHONUNBUFFERED=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-EPOCHS=${EPOCHS:-40}
-
-nvidia-smi || true
 mkdir -p outputs
+mkdir -p /scratch/$USER/tmp 2>/dev/null || true
+export TMPDIR=/scratch/$USER/tmp
 
-echo "=========================================="
-echo "OFFICIAL RUN START $(date)"
-echo "Config: C1-C4 batch 8 x2, C5 batch 16 x1, epochs $EPOCHS"
-echo "=========================================="
+CONFIGS=("C1" "C2" "C3" "C4" "C5")
 
-for CFG in C1 C2 C3 C4; do
-    $PY -u src/train.py \
-        --config "$CFG" \
-        --epochs "$EPOCHS" \
-        --batch-size 8 --grad-accum-steps 2 \
-        --eval-batch-size 8 --num-workers 2 \
-        --eval-greedy-every 4 \
-        --run-name "$CFG" \
-        --wandb --wandb-project "$WANDB_PROJECT" --wandb-entity "$WANDB_ENTITY" \
-        --hf-repo "IrishBumfuzzle/anlp-a1-$CFG" \
-        --output-dir "outputs/$CFG" 2>&1
-    echo "=== $CFG DONE $(date) ==="
+# --- Case 1: Running as a SLURM Job Array task ---
+if [ -n "$SLURM_ARRAY_TASK_ID" ]; then
+    TASK_IDX=$((SLURM_ARRAY_TASK_ID - 1))
+    CFG="${CONFIGS[$TASK_IDX]}"
+    echo "=========================================="
+    echo "SLURM Array Job: $SLURM_ARRAY_JOB_ID, Task: $SLURM_ARRAY_TASK_ID -> Config: $CFG"
+    echo "Node: $HOSTNAME | GPU: $CUDA_VISIBLE_DEVICES"
+    echo "=========================================="
+    exec bash scripts/run_experiment.sh "$CFG" "${EPOCHS:-40}"
+fi
+
+# --- Case 2: Running from interactive shell / head node with SLURM ---
+if command -v sbatch &>/dev/null; then
+    echo "=========================================="
+    echo "SLURM detected. Submitting all 5 configs in parallel..."
+    echo "=========================================="
+    for CFG in "${CONFIGS[@]}"; do
+        JOB_ID=$(sbatch --job-name="anlp_${CFG}" scripts/run_experiment.sh "$CFG" "${EPOCHS:-40}" | awk '{print $NF}')
+        echo "  [Submitted] Config: $CFG -> SLURM Job ID: $JOB_ID"
+    done
+    echo "All 5 jobs submitted in parallel!"
+    echo "Check queue status with: squeue -u $USER"
+    squeue -u "$USER" || true
+    exit 0
+fi
+
+# --- Case 3: Running locally without SLURM (background parallel processes) ---
+echo "=========================================="
+echo "No SLURM detected. Launching all 5 configurations in parallel locally..."
+echo "=========================================="
+PIDS=()
+for CFG in "${CONFIGS[@]}"; do
+    echo "Starting $CFG in background -> outputs/${CFG}.log ..."
+    bash scripts/run_experiment.sh "$CFG" "${EPOCHS:-40}" > "outputs/${CFG}.log" 2>&1 &
+    PIDS+=($!)
 done
 
-$PY -u src/train.py \
-    --config C5 \
-    --epochs "$EPOCHS" \
-    --batch-size 16 --grad-accum-steps 1 \
-    --eval-batch-size 16 --num-workers 2 \
-    --eval-greedy-every 4 \
-    --run-name C5 \
-    --wandb --wandb-project "$WANDB_PROJECT" --wandb-entity "$WANDB_ENTITY" \
-    --hf-repo "IrishBumfuzzle/anlp-a1-C5" \
-    --output-dir "outputs/C5" 2>&1
-echo "=== C5 DONE $(date) ==="
-echo "ALL RUNS DONE $(date)"
-echo
-echo "Next steps:"
-echo "  $PY scripts/make_results_table.py outputs   # LaTeX table for the report"
-echo "  bash scripts/make_submission.sh <roll number>"
+echo "Running background PIDs: ${PIDS[*]}"
+echo "Waiting for all parallel jobs to complete..."
+
+FAILED=0
+for pid in "${PIDS[@]}"; do
+    wait "$pid" || FAILED=1
+done
+
+if [ "$FAILED" -eq 0 ]; then
+    echo "All parallel runs completed successfully!"
+    if [ -f "$DIR/.venv_cluster/bin/python" ]; then
+        "$DIR/.venv_cluster/bin/python" scripts/make_results_table.py outputs || true
+    elif [ -f "$DIR/.venv/bin/python" ]; then
+        "$DIR/.venv/bin/python" scripts/make_results_table.py outputs || true
+    fi
+else
+    echo "One or more runs encountered errors. Check outputs/*.log for details."
+    exit 1
+fi

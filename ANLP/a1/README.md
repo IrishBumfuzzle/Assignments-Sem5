@@ -94,7 +94,7 @@ local-attention encoder/decoder, exactly as in the assignment table.
 |   |   |-- norm.py        # LayerNorm, RMSNorm (from scratch)
 |   |   |-- positional.py  # Sinusoidal PE, RoPE (from scratch)
 |   |   `-- transformer.py # Seq2SeqTransformer (C1-C4), BLTModel (C5)
-|   |-- dataset.py         # BPE tokenizers, datasets, length-bucketed loaders
+|   |-- dataset.py         # BPE tokenizers, datasets, collation (random batches default)
 |   |-- train.py           # Main training loop with WandB + HF upload
 |   `-- utils.py           # Metrics (bit acc, seq acc, Levenshtein, BLEU, ROUGE-L) + plots
 |-- scripts/
@@ -103,6 +103,7 @@ local-attention encoder/decoder, exactly as in the assignment table.
 |   |-- submit_all.sh      # Submit C1..C5 (SLURM)
 |   |-- eval_checkpoint.py # Re-evaluate a saved checkpoint (any split)
 |   |-- make_results_table.py  # Print report tables from results.json files
+|   |-- upload_to_hf.py        # (Re)upload checkpoints to HuggingFace
 |   `-- setup_cluster.sh   # One-time .venv_cluster setup
 |-- data/                  # brown_cipher.txt, brown_plain.txt
 |-- outputs/               # Per-config results, checkpoints, plots, tokenizers
@@ -140,7 +141,8 @@ bash scripts/run_all.sh              # C1..C5, 40 epochs each (~13-15 h total)
 `run_all.sh` uses the final recipe: C1–C4 with `--batch-size 8
 --grad-accum-steps 2` (byte targets, T up to ~2672), C5 with `--batch-size 16
 --grad-accum-steps 1`; fp16 + GradScaler is selected automatically on the
-2080 Ti (cc 7.5). WandB logs go to `irishbumfuzzle-team/anlp-assignment1`;
+2080 Ti (cc 7.5). The official runs used the same recipe via `submit_all.sh`
+(5 parallel SLURM jobs). WandB logs go to `irishbumfuzzle-team/anlp-assignment1`;
 best checkpoints upload to `IrishBumfuzzle/anlp-a1-C{1..5}` when `HF_TOKEN`
 is set (without it the runs still complete; upload the `.pt` files manually
 later if needed).
@@ -152,17 +154,13 @@ WANDB_API_KEY=... HF_TOKEN=... \
 python src/train.py --config C1 --wandb --hf-repo <user>/anlp-a1-c1
 ```
 
-SLURM cluster (alternative):
-
+SLURM cluster (how the official runs were submitted):
 ```bash
 bash scripts/setup_cluster.sh        # once, on a node
-bash scripts/submit_all.sh           # submits C1..C5 (40 epochs each)
-# single config: sbatch --job-name=anlp_C2 scripts/run_experiment.sh C2
-# with HF upload:  HF_REPO=<user>/anlp-a1-c2 sbatch ... scripts/run_experiment.sh C2
+sbatch scripts/submit_all.sh         # 5 parallel jobs, one config each
+sbatch scripts/run_experiment.sh C1  # or a single config
 ```
 
-Notes:
-- Mixed precision is selected automatically: **bf16** on Ampere+ GPUs,
   **fp16 + GradScaler** on older ones (e.g. RTX 2080 Ti, compute cap 7.5).
 - Byte targets have heavy length variance (median ~600 bytes, max ~2670).
   Training uses **random batches** (see the design note above); on a 6 GB
@@ -224,6 +222,27 @@ reproducibility: `--prefix-dropout`, `--scheduled-sampling` (+ `--ss-max-p`,
 
 ## Results
 
-*(filled in after training runs — `python scripts/make_results_table.py
-outputs` prints the table rows; WandB run URLs and HuggingFace checkpoint
-links go here and in the report.)*
+Official runs: 40 epochs, single RTX 2080 Ti (fp16 + GradScaler), 500-line
+test set (C5: 426 — lines with >1024-byte ciphertexts are excluded from its
+raw-byte source). Greedy decoding, best checkpoint by val loss.
+Regenerate: `python scripts/make_results_table.py outputs`.
+
+| Config | Bit acc | Seq acc | Levenshtein ↓ | BLEU | ROUGE-L | Best epoch |
+|--------|---------|---------|---------------|------|---------|------------|
+| C1 Base | 0.6902 | 0.0060 | 313.8 | 0.6870 | 0.6908 | 35 |
+| C2 RoPE | 0.6773 | 0.0000 | 720.2 | 0.1840 | 0.3922 | 18 |
+| C3 GQA (kv=4) | 0.6905 | 0.0040 | 311.2 | 0.6921 | 0.6945 | 36 |
+| C4 RMSNorm | 0.6902 | 0.0020 | 321.4 | 0.6804 | 0.6832 | 36 |
+| C5 BLT | **1.0000** | **0.9343** | **0.1** | 0.9996 | 0.9998 | 39 |
+
+Baseline: always-space predictor 0.662 bit acc. Teacher-forced val bit acc at
+best epoch (C1 0.927, C2 0.875, C3 0.926, C4 0.925, C5 0.9999) shows the
+cipher itself is learned; the C1–C4 test scores are the exposure-bias ceiling
+under greedy decoding (see `report/Report.tex`, Section 3, and
+`IMPLEMENTATION.md` §8).
+
+WandB: <https://wandb.ai/irishbumfuzzle-team/anlp-assignment1> (runs: C1
+`pz4akfn6`, C2 `k7i8v6qx`, C3 `5ssmwo4e`, C4 `1j34vx49`, C5 `ldihh8vu`).
+Hugging Face (best + last checkpoints, tokenizers, results):
+<https://huggingface.co/IrishBumfuzzle/anlp-a1-C1> –
+<https://huggingface.co/IrishBumfuzzle/anlp-a1-C5>.
