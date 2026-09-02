@@ -31,6 +31,21 @@ BYTE_DIM=${11:-64}
 VOCAB_SIZE=${12:-8000}
 GRAD_ACCUM=${13:-2}
 KV_HEADS=${14:-4}
+PATCHING=${15:-entropy}
+MAX_PATCH=${16:-12}
+TARGET_PATCH_SIZE=${17:-4.0}
+THETA_R=${18:-1.0}
+
+# optional env overrides
+RUN_NAME=${RUN_NAME:-$CONFIG}
+OUT_DIR=${OUT_DIR:-outputs}
+# set SKIP_HF=1 to skip the (tokenless) auto HF upload attempt
+HF_ARGS=""
+if [ -n "$HF_REPO" ]; then
+    HF_ARGS="--hf-repo $HF_REPO"
+elif [ "${SKIP_HF:-0}" != "1" ]; then
+    HF_ARGS="--hf-repo IrishBumfuzzle/anlp-a1-$CONFIG"
+fi
 
 if [ "$CONFIG" = "C5" ] && [ -z "$3" ]; then
     BATCH_SIZE=16
@@ -67,6 +82,7 @@ echo "Repo:     $DIR"
 echo "Start:    $(date)"
 echo "Python:   $PY ($($PY --version 2>&1))"
 echo "Config:   $CONFIG | Epochs: $EPOCHS | Batch: $BATCH_SIZE (x$GRAD_ACCUM accum) | LR: $LR | Dim: $DIM | Heads: $HEADS (kv: $KV_HEADS) | Layers: $LAYERS | MaxSrc: $MAX_SRC | MaxTgt: $MAX_TGT | Vocab: $VOCAB_SIZE"
+echo "Patching: $PATCHING | max_patch: $MAX_PATCH | target mean: $TARGET_PATCH_SIZE | theta_r: $THETA_R | run: $RUN_NAME | out: $OUT_DIR"
 echo "=========================================="
 
 nvidia-smi || true
@@ -78,17 +94,11 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-HF_ARGS=""
-if [ -n "$HF_REPO" ]; then
-    HF_ARGS="--hf-repo $HF_REPO"
-    echo "HuggingFace upload enabled: $HF_REPO"
-else
-    HF_ARGS="--hf-repo IrishBumfuzzle/anlp-a1-$CONFIG"
-fi
+[ -n "$HF_ARGS" ] && echo "HuggingFace upload enabled: $HF_ARGS"
 
 $PY -u src/train.py \
     --config "$CONFIG" \
-    --run-name "$CONFIG" \
+    --run-name "$RUN_NAME" \
     --epochs "$EPOCHS" \
     --batch-size "$BATCH_SIZE" \
     --lr "$LR" \
@@ -102,15 +112,19 @@ $PY -u src/train.py \
     --vocab-size "$VOCAB_SIZE" \
     --patch-size "$PATCH_SIZE" \
     --byte-dim "$BYTE_DIM" \
+    --patching "$PATCHING" \
+    --max-patch "$MAX_PATCH" \
+    --target-patch-size "$TARGET_PATCH_SIZE" \
+    --theta-r "$THETA_R" \
     --wandb-project "$WANDB_PROJECT" \
     --wandb-entity "$WANDB_ENTITY" \
-    --output-dir "outputs/$CONFIG" \
+    --output-dir "$OUT_DIR" \
     $HF_ARGS \
     --wandb
 
 EXIT_CODE=$?
 echo "=========================================="
 echo "Job finished $(date) with exit code $EXIT_CODE"
-echo "Results: $DIR/outputs/$CONFIG/results.json"
+echo "Results: $DIR/$OUT_DIR/$CONFIG/results.json"
 echo "=========================================="
 exit $EXIT_CODE

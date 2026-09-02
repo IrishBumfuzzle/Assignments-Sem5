@@ -66,6 +66,36 @@ def main():
     out_dir = os.path.dirname(os.path.abspath(cli.checkpoint))
     device = T.pick_device(args.device)
 
+    # C5: restore the (dynamic) patch structures saved with the checkpoint.
+    patch_structures = None
+    if is_blt:
+        patching = ckpt.get("patching") or {}
+        if patching.get("method") == "entropy" and "entropy_lm" in ckpt:
+            from dataset import cipher_bytes_of
+            from entropy_patching import (ByteEntropyLM, EntropyLMConfig,
+                                         build_patch_structures,
+                                         next_byte_entropies)
+            pelm = ByteEntropyLM(EntropyLMConfig(**ckpt["entropy_lm"]["cfg"]))
+            pelm.load_state_dict(ckpt["entropy_lm"]["state"])
+            pelm.to(device).eval()
+            kept = []
+            for c, _ in split[cli.split]:
+                cb = cipher_bytes_of(c)
+                if len(cb) <= args.max_src_len:
+                    kept.append(list(cb))
+            H = next_byte_entropies(pelm, kept, device)
+            patch_structures = {cli.split: build_patch_structures(
+                kept, patching["theta_g"], patching.get("theta_r", 0.25),
+                patching.get("max_patch", 12), H)}
+            n_bytes = sum(len(x) for x in kept)
+            n_patches = sum(len(l) for _, l in patch_structures[cli.split])
+            print(f"[c5] entropy patching restored: theta_g={patching['theta_g']:.4f} "
+                  f"| mean patch {n_bytes / max(n_patches, 1):.2f} bytes")
+        elif not patching:
+            print("[c5] note: checkpoint has no patching info (pre-entropy C5 "
+                  "checkpoint uses the old fixed-patch architecture and cannot "
+                  "be loaded by the current model code)")
+
     if use_bytes_target:
         args.max_tgt_len = max(len(p) for pl in split.values() for _, p in pl) + 2
 
@@ -79,7 +109,8 @@ def main():
         tokenizers = (cipher_tok, plain_tok)
 
     loaders = T.make_dataloaders(split, args, tokenizers,
-                                 target_bytes=use_bytes_target)
+                                 target_bytes=use_bytes_target,
+                                 patch_structures=patch_structures)
     src_vocab = cipher_tok.vocab_size if not is_blt else None
     tgt_vocab = (T.BYTE_VOCAB if use_bytes_target else plain_tok.vocab_size) \
         if not is_blt else None

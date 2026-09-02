@@ -16,7 +16,7 @@ Two data paths (matching the ablation table):
 """
 
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -240,22 +240,37 @@ class ByteTargetCipherDataset(Dataset):
 
 
 class ByteCipherDataset(Dataset):
-    """C5 (BLT): raw bytes.  src = cipher bytes, tgt = plaintext bytes (1:1)."""
+    """C5 (BLT): raw bytes.  src = cipher bytes, tgt = plaintext bytes (1:1).
 
-    def __init__(self, pairs, max_len: int):
-        self.items: List[Tuple[List[int], List[int], str]] = []
+    ``patch_structures``: optional per-line (starts, lens) list for the lines
+    that survive the max_len filter -- normally entropy-based dynamic patches
+    (see entropy_patching.py); when None, fixed stride-4 patches are used
+    (legacy ablation behaviour).
+    """
+
+    def __init__(self, pairs, max_len: int,
+                 patch_structures: Optional[List[Tuple[List[int], List[int]]]] = None):
+        self.items: List[Tuple[List[int], List[int], str, list, list]] = []
         for c, p in pairs:
             cb = cipher_bytes_of(c)
             if len(cb) <= max_len:
-                self.items.append((list(cb), [ord(ch) for ch in p], p))
+                if patch_structures is not None:
+                    starts, lens = patch_structures[len(self.items)]
+                else:
+                    from entropy_patching import fixed_stride
+                    starts, lens = fixed_stride(len(cb), 4)
+                self.items.append((list(cb), [ord(ch) for ch in p], p,
+                                   list(starts), list(lens)))
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, i):
-        s, t, _ = self.items[i]
+        s, t, _, starts, lens = self.items[i]
         return {"src": torch.tensor(s, dtype=torch.long),
-                "tgt": torch.tensor(t, dtype=torch.long)}
+                "tgt": torch.tensor(t, dtype=torch.long),
+                "patch_starts": torch.tensor(starts, dtype=torch.long),
+                "patch_lens": torch.tensor(lens, dtype=torch.long)}
 
     def refs(self) -> List[str]:
         return [item[2] for item in self.items]
@@ -335,21 +350,36 @@ def collate_byte_target(batch):
 def collate_bytes(batch):
     src = pad_sequence([b["src"] for b in batch], batch_first=True, padding_value=BYTE_PAD)
     tgt = pad_sequence([b["tgt"] for b in batch], batch_first=True, padding_value=BYTE_PAD)
+    B = len(batch)
+    Np = max(b["patch_lens"].size(0) for b in batch)
+    patch_starts = torch.full((B, Np), 2 ** 31, dtype=torch.long)
+    patch_lens = torch.zeros((B, Np), dtype=torch.long)
+    for i, b in enumerate(batch):
+        n = b["patch_lens"].size(0)
+        if n:
+            patch_starts[i, :n] = b["patch_starts"]
+            patch_lens[i, :n] = b["patch_lens"]
     return {
         "src": src,
         "src_mask": src != BYTE_PAD,
         "tgt": tgt,
         "lengths": torch.tensor([len(b["src"]) for b in batch], dtype=torch.long),
+        "patch_starts": patch_starts,
+        "patch_lens": patch_lens,
     }
 
 
 def make_dataloaders(split_pairs: Dict[str, list], args, tokenizers=None,
-                     target_bytes: bool = False
+                     target_bytes: bool = False,
+                     patch_structures: Optional[Dict[str, list]] = None
                      ) -> Dict[str, DataLoader]:
     """split_pairs: {"train": [...], "val": [...], "test": [...]}.
 
     tokenizers=None -> raw-byte (BLT) datasets for C5.
     target_bytes=True -> C1-C4 byte-target datasets (cipher BPE -> plain bytes).
+    patch_structures: per-split (starts, lens) lists for C5 dynamic patching;
+    keys are the split names that have structures (others fall back to
+    fixed stride-4).
     """
     cipher_tok, plain_tok = (None, None) if tokenizers is None else tokenizers
     loaders = {}
@@ -362,7 +392,9 @@ def make_dataloaders(split_pairs: Dict[str, list], args, tokenizers=None,
     for name in ("train", "val", "test"):
         pairs = split_pairs[name]
         if tokenizers is None:
-            d = ByteCipherDataset(pairs, max_len=args.max_src_len)
+            structs = (patch_structures or {}).get(name)
+            d = ByteCipherDataset(pairs, max_len=args.max_src_len,
+                                  patch_structures=structs)
         elif target_bytes:
             d = ByteTargetCipherDataset(
                 pairs, cipher_tok,

@@ -19,9 +19,14 @@ src/
                       FFN (GELU), pre-norm encoder/decoder blocks
     positional.py     sinusoidal PE + RoPE (from scratch)
     norm.py           LayerNorm + RMSNorm (from scratch, fp32 stats for fp16 safety)
-    blt.py            C5 patch modules: LocalByteEncoder / LocalByteDecoder
+    blt.py            C5 variable-patch modules: LocalByteEncoder /
+                      LocalByteDecoder (byte + rolling-hash n-gram embeddings,
+                      banded local-window transformer, cross-attention pooling)
     transformer.py    TransformerConfig, encoder/decoder stacks, Seq2SeqTransformer
                       (forward, generate() with KV cache), BLTModel (C5)
+  entropy_patching.py C5 entropy-based dynamic patching (BLT paper Sec 2.3):
+                      ByteEntropyLM (next-byte entropy model), patch_line,
+                      theta_g calibration, patch structures, self-test
   train.py            config dispatch (CONFIGS C1-C5), training loop, AMP,
                       scheduling, evaluation, checkpoints, WandB, HF upload,
                       exposure-bias probes (prefix dropout, scheduled sampling)
@@ -29,9 +34,13 @@ src/
                       ROUGE-L) — all vectorized NumPy, no NLTK — + plots
 scripts/
   setup_cluster.sh    venv + deps (PyTorch cu124 wheel for the 2080 Ti)
-  run_experiment.sh   single-GPU one-config runner (WandB + HF)
+  run_experiment.sh   single-GPU one-config runner (WandB + HF; RUN_NAME/
+                      OUT_DIR env overrides for C5 ablations)
   submit_all.sh       SLURM job script + submission of all 5 configs
-  eval_checkpoint.py  re-evaluate any checkpoint (greedy test pass)
+  submit_c5.sh        SLURM submission of C5-entropy (official) + C5-fixed
+                      (ablation control), 120 epochs each
+  eval_checkpoint.py  re-evaluate any checkpoint (greedy test pass; restores
+                      entropy patching from the checkpoint for C5)
   make_results_table.py  regenerate report tables from outputs/*/results.json
   make_submission.sh  build the Moodle zip (code + outputs, no .pt files)
 report/Report.tex     the report
@@ -104,17 +113,46 @@ Shared budget: `d_model=256`, 8 heads, 4 encoder + 4 decoder layers, FFN 1024
   positions) — i.e., there is no KV-cache or position-tracking bug in the
   decoding path.
 
-### 3.5 C5 — BLT (`models/blt.py`)
+### 3.5 C5 — BLT with entropy-based dynamic patching (`models/blt.py`, `entropy_patching.py`)
 Token-free, non-autoregressive:
 - Source: raw ciphertext **bytes**, no tokenization (1 byte = 1 position,
   capped at `max_src_len=1024` bytes; lines longer than that are *excluded*,
   giving 4363/5000 lines: 3506/431/426 per split).
-- Each byte is embedded into a `byte_dim=64` embedding (plus a learned
-  patch-neighborhood context: `patch_size=4` — a local 1D convolution mixes the
-  4-byte window, so the model sees adjacent bytes and the phase pattern).
+- **Entropy-based dynamic patching** (BLT paper, Sec 2.3) replaces fixed
+  stride-4 grouping. A small auxiliary next-byte model
+  (`ByteEntropyLM`: 2 layers, d=128, 4 heads, FFN 256, causal window 256,
+  ~0.461M params, trained 40 epochs on train-split cipher bytes only,
+  seed = main seed + 1000) yields per-position next-byte entropies $H(x_t)$ in
+  bits (computed with a per-line context reset, in batches). A patch boundary
+  is placed where `H > theta_g` (global threshold), where the entropy change
+  `dH > theta_r` (relative, default 1.0 bit), or at the hard cap
+  `max_patch=12`. `theta_g` is calibrated by bisection so the mean patch size
+  on the train split is exactly 4.0 bytes (compute-matched to fixed stride 4):
+  on the full train split this gives `theta_g=4.6311`, patch sizes 1–12
+  (5.5% one-byte patches, 435,925 patches). The mechanism is incremental
+  (each patch's decision uses only preceding bytes), self-tested by
+  `verify_incremental()` at run start. Note: a sweep of `theta_r` showed that
+  smaller relative thresholds make the relative trigger fire too often on this
+  data (mean patch stuck below 4), so `theta_r=1.0` is the operative setting.
+- Each variable-length patch is encoded by `LocalByteEncoder`: byte embedding
+  (257 x 64) + rolling-hash n-gram embeddings (n = 3..8, one 4096-entry table
+  each, hash `sum(b_i * 131^(n-1-i)) mod (2^31-1)`, L2-normalized /7 sum) +
+  2 layers of banded causal local attention (window 16, heads 4, pre-LN),
+  pooled into one latent per patch by cross-attention with separate K/V
+  projections (pre-LN on the keys/values *before* projection).
+- The global transformer (4 layers, 8 heads, 256-dim, sinusoidal PE,
+  LayerNorm — the C1 stack) runs over the patch latents.
+- `LocalByteDecoder` expands each patch back to bytes: encoder output at each
+  byte position + a learned slot-offset embedding (0..11), cross-attention to
+  the patch's own latent, one banded local causal layer, 256-way byte head.
 - Target: the plaintext byte at the **same index** (1:1 mapping), predicted in
-  parallel with a 256-way softmax. No autoregression ⇒ **no exposure bias**.
-- This config is the "what if there were no alignment problem at all" baseline.
+  parallel. No autoregression ⇒ **no exposure bias**.
+- NaN-safety: local attention masks always allow the diagonal; padded queries
+  in cross-attention attend to a dummy key, so no fully-masked rows (which
+  produce NaN in backward through softmax).
+- Checkpoint stores the entropy LM state + patching params
+  (`theta_g`, `theta_r`, `max_patch`); `eval_checkpoint.py` restores them so
+  evaluation reproduces the exact training-time patch boundaries.
 
 ### 3.6 Activation checkpointing
 All encoder and decoder blocks are wrapped with
@@ -298,7 +336,13 @@ stated). It is also the substance of the report's Design Decisions section.
 | C2 RoPE | 9.54M | 0.6773 | 0.0000 | 720.2 | 0.1840 | 0.3922 | 18 | 150 min |
 | C3 GQA (kv=4) | 9.02M | 0.6905 | 0.0040 | 311.2 | 0.6921 | 0.6945 | 36 | 141 min |
 | C4 RMSNorm | 9.54M | 0.6902 | 0.0020 | 321.4 | 0.6804 | 0.6832 | 36 | 132 min |
-| C5 BLT | 3.39M | 1.0000 | 0.9343 | 0.1 | 0.9996 | 0.9998 | 39 | 15 min |
+| C5 BLT (entropy patches) | 5.55M | 0.9797 † | 0.0047 † | 40.4 † | 0.8463 † | 0.9187 † | 40 † | ~1 h + ~10 min entropy LM |
+
+† 40-epoch values; the official C5 is retrained for 120 epochs on the server
+(`scripts/submit_c5.sh`) — final numbers pending. The superseded fixed-patch
+C5 (3.39M, 1.0000/0.9343/0.1/0.9996/0.9998) is archived in
+`../a1-stale-runs-backup/C5-old-fixed4/` and re-run as the `C5-fixed`
+ablation control under the new architecture.
 
 Test set: 500 lines (C5: 426 — lines with >1024-byte ciphertext are excluded
 from its raw-byte source). Baseline: always-space 0.662. TF val bit acc at best
@@ -324,6 +368,14 @@ the alignment is given for free.
 | Attention softmax in fp16 | -inf/NaN on long masks | softmax in fp32 under autocast |
 | Wandb API key typo in an old script | instant `CommError` | key from `~/.netrc`; plus 3-attempt retry + offline fallback in `train.py` |
 | `pgrep -f "A\|B"` | ERE: `\|` is literal; double-launched a run, OOM | use `|` or separate patterns; kill by explicit PID |
+| n-gram valid-mask broadcast (C5) | wrong n-gram embeddings / shape error | mask is `(1, L, 1)`, not `(B, 1, 1)` — it must mask along the byte axis |
+| `patch_of_byte` via `searchsorted` | CUDA assert / wrong index | query positions must be a full `(B, L)` grid; `pos` expanded and `.contiguous()` |
+| CrossAttention missing `q_dim` | `AttributeError` in forward | store `self.q_dim` in `__init__` (q_proj input width) |
+| pre-LN applied after K/V projection (C5) | degraded pooling | `kv_norm` must run on the encoder output *before* `k_proj`/`v_proj` |
+| decoder batch/len taken from memory (C5) | shape mismatch (memory is patch-level) | take `B, L` from `h_enc.shape`, not `memory.shape` |
+| local mask rank (C5) | batch↔head mis-broadcast `(B, L, L)` | mask built as `(B, 1, L, L)` = `band.unsqueeze(0).unsqueeze(1) & byte_mask.view(B,1,1,L)` |
+| fully-masked attention rows → NaN grad (C5) | NaN loss after a few steps | diagonal always allowed in local layers; padded cross-attn queries get a dummy key-0 |
+| `searchsorted` non-contiguous input | CUDA warning + possible wrong result | `.contiguous()` on the expanded position grid |
 
 ## 11. Reproduction
 
@@ -332,10 +384,21 @@ bash scripts/setup_cluster.sh                 # venv with torch (cu124) + deps
 export WANDB_API_KEY=...                       # wandb team irishbumfuzzle-team
 export HF_TOKEN=...                            # optional; uploads best ckpts
 bash scripts/run_experiment.sh C1              # one config, ~2.2 h on 2080 Ti
-bash scripts/submit_all.sh                     # SLURM: all five in parallel
+bash scripts/submit_all.sh                     # SLURM: C1-C4 (C5 via submit_c5.sh)
+bash scripts/submit_c5.sh                      # SLURM: C5-entropy (120ep, official)
+                                               # + C5-fixed (120ep, ablation)
 python scripts/eval_checkpoint.py --checkpoint outputs/C1/model_best.pt
 python scripts/make_results_table.py outputs   # regenerate report tables
 bash scripts/make_submission.sh <roll_number>  # the Moodle zip
+```
+
+C5 CLI (for reference):
+```bash
+python src/train.py --config C5 --patching entropy --max-patch 12 \
+  --target-patch-size 4.0 --theta-r 1.0 --local-window 16 --ngram-table 4096 \
+  --entropy-epochs 40 --entropy-dim 128 --entropy-layers 2 --entropy-heads 4 \
+  --entropy-ffn 256 --entropy-window 256
+# fixed-patch control: --patching fixed --patch-size 4
 ```
 
 Single-GPU sanity check before a long run:
@@ -347,7 +410,12 @@ Single-GPU sanity check before a long run:
 - Single seed per config (spread within ±0.014 across C1/C3/C4; ordering of the
   ablation is unaffected at this scale).
 - Greedy-only evaluation (assignment protocol); beam/sampling not scored.
-- C5 excludes lines longer than the 1024-byte raw source cap.
+- C5 excludes lines longer than the 1024-byte raw source cap. C5 is trained
+  for 120 epochs (vs 40 for C1-C4) because the entropy-patching model
+  converges more slowly; depth/width/LR/batch are identical.
+- C5's patch boundaries come from a small auxiliary next-byte model trained on
+  the train split only; val/test boundaries use the same frozen model and
+  `theta_g` (no target-side information leaks into patching).
 - RoPE's negative result is task-specific (alignment-heavy, long, positional
   correspondence) and should not be generalized to semantic seq2seq.
 - The byte-level target is a target-side design choice; the ciphertext

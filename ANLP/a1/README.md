@@ -17,7 +17,7 @@ test set is a pure model-quality probe.
 | C2     | RoPE               | MHA           | LayerNorm     | + byte-level target                          |
 | C3     | Sinusoidal         | GQA (kv=4)    | LayerNorm     | + byte-level target                          |
 | C4     | Sinusoidal         | MHA           | RMSNorm       | + byte-level target                          |
-| C5     | Sinusoidal         | MHA           | LayerNorm     | BLT token-free (raw bytes, patch 4)          |
+| C5     | Sinusoidal         | MHA           | LayerNorm     | BLT token-free (raw bytes, entropy patches)  |
 
 Shared: `dim=256, heads=8, layers=4, dim_ff=1024, dropout=0.1, lr=5e-4
 (warmup 250 + cosine to 1e-5), AdamW (wd 0.01), grad clip 1.0, effective
@@ -81,8 +81,15 @@ against references in dataset order silently corrupts every bit/Levenshtein/
 BLEU number (the training loss is unaffected, since it is computed per
 batch).
 
-**C5 (BLT)** uses raw cipher bytes with patch size 4 and a token-free
-local-attention encoder/decoder, exactly as in the assignment table.
+**C5 (BLT)** uses raw cipher bytes with **entropy-based dynamic patching**
+(BLT paper, Sec 2.3) and a token-free local-attention encoder/decoder. A small
+auxiliary next-byte model (`entropy_patching.py`) scores each position's
+next-byte entropy; patches end where that entropy crosses a calibrated global
+threshold `theta_g` (or a relative jump `theta_r`, or a 12-byte cap). `theta_g`
+is bisection-calibrated so the mean patch is 4.0 bytes (compute-matched to a
+fixed stride-4 grouping): on the train split this gives `theta_g=4.63`, patch
+sizes 1-12. A fixed stride-4 control (`--patching fixed`) is provided as an
+ablation (`outputs/ablations/C5`).
 
 ## Repository layout
 
@@ -90,17 +97,19 @@ local-attention encoder/decoder, exactly as in the assignment table.
 |-- src/
 |   |-- models/
 |   |   |-- attention.py   # SDPA, MHA, GQA, FFN, encoder/decoder blocks
-|   |   |-- blt.py         # BLT local byte encoder/decoder (C5)
+|   |   |-- blt.py         # BLT variable-patch local byte encoder/decoder (C5)
 |   |   |-- norm.py        # LayerNorm, RMSNorm (from scratch)
 |   |   |-- positional.py  # Sinusoidal PE, RoPE (from scratch)
 |   |   `-- transformer.py # Seq2SeqTransformer (C1-C4), BLTModel (C5)
 |   |-- dataset.py         # BPE tokenizers, datasets, collation (random batches default)
+|   |-- entropy_patching.py # C5 entropy-based dynamic patching (BLT Sec 2.3)
 |   |-- train.py           # Main training loop with WandB + HF upload
 |   `-- utils.py           # Metrics (bit acc, seq acc, Levenshtein, BLEU, ROUGE-L) + plots
 |-- scripts/
 |   |-- run_all.sh         # Run C1..C5 sequentially on one standalone GPU (target machine)
 |   |-- run_experiment.sh  # SLURM job script (any config)
-|   |-- submit_all.sh      # Submit C1..C5 (SLURM)
+|   |-- submit_all.sh      # Submit C1..C4 (SLURM)
+|   |-- submit_c5.sh       # Submit C5-entropy (official, 120ep) + C5-fixed (SLURM)
 |   |-- eval_checkpoint.py # Re-evaluate a saved checkpoint (any split)
 |   |-- make_results_table.py  # Print report tables from results.json files
 |   |-- upload_to_hf.py        # (Re)upload checkpoints to HuggingFace
@@ -222,9 +231,10 @@ reproducibility: `--prefix-dropout`, `--scheduled-sampling` (+ `--ss-max-p`,
 
 ## Results
 
-Official runs: 40 epochs, single RTX 2080 Ti (fp16 + GradScaler), 500-line
-test set (C5: 426 — lines with >1024-byte ciphertexts are excluded from its
-raw-byte source). Greedy decoding, best checkpoint by val loss.
+Official runs: 40 epochs (C5: 120, it converges more slowly), single RTX
+2080 Ti (fp16 + GradScaler), 500-line test set (C5: 426 — lines with
+>1024-byte ciphertexts are excluded from its raw-byte source). Greedy
+decoding, best checkpoint by val loss.
 Regenerate: `python scripts/make_results_table.py outputs`.
 
 | Config | Bit acc | Seq acc | Levenshtein ↓ | BLEU | ROUGE-L | Best epoch |
@@ -233,16 +243,20 @@ Regenerate: `python scripts/make_results_table.py outputs`.
 | C2 RoPE | 0.6773 | 0.0000 | 720.2 | 0.1840 | 0.3922 | 18 |
 | C3 GQA (kv=4) | 0.6905 | 0.0040 | 311.2 | 0.6921 | 0.6945 | 36 |
 | C4 RMSNorm | 0.6902 | 0.0020 | 321.4 | 0.6804 | 0.6832 | 36 |
-| C5 BLT | **1.0000** | **0.9343** | **0.1** | 0.9996 | 0.9998 | 39 |
+| C5 BLT (entropy) | **0.9797** † | 0.0047 † | **40.4** † | **0.8463** † | **0.9187** † | 40 † |
+
+† C5 40-epoch values; the official C5 is retrained for 120 epochs
+(`scripts/submit_c5.sh`) — final numbers pending.
 
 Baseline: always-space predictor 0.662 bit acc. Teacher-forced val bit acc at
-best epoch (C1 0.927, C2 0.875, C3 0.926, C4 0.925, C5 0.9999) shows the
+best epoch (C1 0.927, C2 0.875, C3 0.926, C4 0.925) shows the
 cipher itself is learned; the C1–C4 test scores are the exposure-bias ceiling
 under greedy decoding (see `report/Report.tex`, Section 3, and
 `IMPLEMENTATION.md` §8).
 
 WandB: <https://wandb.ai/irishbumfuzzle-team/anlp-assignment1> (runs: C1
-`pz4akfn6`, C2 `k7i8v6qx`, C3 `5ssmwo4e`, C4 `1j34vx49`, C5 `ldihh8vu`).
+`pz4akfn6`, C2 `k7i8v6qx`, C3 `5ssmwo4e`, C4 `1j34vx49`, C5 `C5-entropy`
+and `C5-fixed`).
 Hugging Face (best + last checkpoints, tokenizers, results):
 <https://huggingface.co/IrishBumfuzzle/anlp-a1-C1> –
 <https://huggingface.co/IrishBumfuzzle/anlp-a1-C5>.

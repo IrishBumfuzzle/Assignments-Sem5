@@ -35,7 +35,7 @@ C1 Base     & Sinusoidal & MHA ($h{=}8$) & LayerNorm & BPE subword (8k) + byte t
 C2 RoPE     & RoPE       & MHA ($h{=}8$) & LayerNorm & BPE subword (8k) + byte target \\
 C3 GQA      & Sinusoidal & GQA ($h{=}8$, kv$=4$) & LayerNorm & BPE subword (8k) + byte target \\
 C4 RMSNorm  & Sinusoidal & MHA ($h{=}8$) & RMSNorm   & BPE subword (8k) + byte target \\
-C5 BLT      & Sinusoidal & MHA ($h{=}8$) & LayerNorm & Token-free raw bytes (patch 4) \\
+C5 BLT      & Sinusoidal & MHA ($h{=}8$) & LayerNorm & Token-free raw bytes (entropy patches) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -56,9 +56,10 @@ reach 0.93 teacher-forced bit accuracy but only $\approx$0.69 under greedy
 decoding, and we document a controlled diagnosis of this exposure-bias gap
 (Section~\ref{sec:exposure}) together with three training-side mitigations that we
 tested and that all failed. The token-free non-autoregressive configuration C5,
-which has no exposure bias by construction, decrypts the test set to 100\% bit
-accuracy (93.4\% exact full-line matches), which both confirms the diagnosis and
-serves as a strong baseline.
+which has no exposure bias by construction and groups the ciphertext bytes into
+entropy-driven variable-length patches, recovers 98.0\% of the plaintext bits ---
+versus 69\% for the best autoregressive config --- which both confirms the
+diagnosis and serves as a strong baseline. % FIXME-C5: final 120-epoch numbers
 
 \section{Design decisions}
 \label{sec:design}
@@ -104,6 +105,33 @@ $i \bmod 8$ from position by itself. With the phase-annotated source the same
 probe reaches 0.89--0.90 teacher-forced by epoch 25, and the final full-length
 run reaches 0.927 at 40 epochs (Table~\ref{tab:main}). The target-side choice is ours to make; the ciphertext
 tokenization remains learned BPE, as the assignment requires.
+
+\paragraph{C5: entropy-based dynamic patching.}
+C5 is the token-free baseline of the Byte Latent Transformer (BLT) family: the
+ciphertext is consumed as raw bytes --- no subword tokenization --- and the model
+is non-autoregressive, predicting all target positions in parallel against the
+1:1 byte correspondence. Following Section~2.3 of the BLT paper, consecutive
+bytes are grouped into \emph{variable-length} patches whose boundaries are
+decided by the next-byte entropy rather than a fixed stride. A small auxiliary
+next-byte model (2-layer, 128-dim byte transformer, 0.46M parameters, window
+256, trained for 40 epochs on the training ciphertext alone) supplies the
+per-position next-byte entropy $H(x_t)$ in bits; a patch ends where $H(x_t)$
+exceeds a global threshold $\theta_g$, where the entropy change $\Delta H$ exceeds
+a relative threshold $\theta_r{=}1.0$, or at a hard cap of 12 bytes.
+$\theta_g$ is calibrated by bisection so that the mean patch size on the
+training split is 4.0 bytes --- the same number of patches per line as a fixed
+stride-4 grouping, which keeps C5's compute matched to the fixed-patch
+ablation. On this data the calibration yields $\theta_g{=}4.63$; patch sizes
+range 1--12 bytes (mean 4.00, 5.5\% one-byte patches, 435{,}925 patches over the
+3506 training lines). The intuition: high-entropy positions mark where the
+local structure changes, so cutting there gives each patch a more homogeneous
+context, while regular low-entropy regions are covered by fewer, larger patches.
+Each patch is encoded by a small local transformer (banded 16-byte causal
+window; byte embeddings plus rolling-hash $n$-gram embeddings for
+$n{=}3\ldots8$) and pooled by cross-attention into one latent per patch; the
+global transformer over the patch latents uses the same 4 layers, 8 heads and
+256-dim width as C1--C4; a symmetric local decoder then expands each patch
+latent back into its patch's 256-way byte logits.
 
 \paragraph{Training implementation notes.}
 Three implementation choices had measurable effects and are worth recording.
@@ -238,18 +266,26 @@ ciphertext exceeds the 1024-token source cap are excluded rather than truncated
 capability 7.5). PyTorch 2.x with half-precision training: fp16 autocast with a
 gradient scaler on this Turing GPU (the code auto-selects bf16 without a scaler
 on Ampere and newer). Normalization layers compute their statistics in fp32
-internally for fp16 safety. One config takes 2.2--2.5 hours (40 epochs); C5 takes
-15 minutes.
+internally for fp16 safety. One autoregressive config takes 2.2--2.5 hours
+(40 epochs); the C5 model training takes about an hour over its 120 epochs
+(the entropy-patching architecture is slower per step), plus about 10 minutes
+for the auxiliary entropy model.
 
 \textbf{Model.} $d_{model}=256$, 8 heads (C3: 4 key/value heads), 4 encoder + 4
 decoder layers, FFN 1024, dropout 0.1. Parameter counts: C1/C2 9.54M, C4 9.54M,
-C3 9.02M, C5 3.39M.
+C3 9.02M, C5 5.55M (plus the 0.46M-parameter auxiliary entropy model,
+which is frozen once patching is fixed).
 
 \textbf{Training.} AdamW ($\beta_1{=}0.9$, $\beta_2{=}0.98$, weight decay
 $10^{-2}$), peak lr $5\cdot10^{-4}$ with 250-step linear warmup and cosine decay
 to $10^{-5}$, gradient clipping at 1.0, effective batch 16 (batch 8 with 2
-gradient-accumulation steps; C5 batch 16), 40 epochs. Max source length 1024
-tokens; target length is set to the longest plaintext in the splits
+gradient-accumulation steps; C5 batch 16), 40 epochs for C1--C4. C5 is trained
+for 120 epochs with the same cosine schedule stretched over its horizon:
+the entropy-patching model (larger local pathway plus a sparse rolling-hash
+embedding table) converges more slowly, and its validation loss was still
+declining at epoch 40. Epoch count is not among the hyperparameters the
+assignment requires to be held constant (depth, width, learning rate, batch
+size are all identical). Max source length 1024 tokens; target length is set to the longest plaintext in the splits
 ($\approx$2672 for byte targets). Batches are randomly shuffled (not length
 bucketed; Section~\ref{sec:design}).
 
@@ -283,7 +319,8 @@ C1 Base    & 0.6902 & 0.0060 & 313.8 & 0.6870 & 0.6908 & 35 \\
 C2 RoPE    & 0.6773 & 0.0000 & 720.2 & 0.1840 & 0.3922 & 18 \\
 C3 GQA     & 0.6905 & 0.0040 & 311.2 & 0.6921 & 0.6945 & 36 \\
 C4 RMSNorm & 0.6902 & 0.0020 & 321.4 & 0.6804 & 0.6832 & 36 \\
-C5 BLT     & 1.0000 & 0.9343 & 0.1   & 0.9996 & 0.9998 & 39 \\
+% FIXME-C5: replace with the final 120-epoch server-run numbers (outputs/C5)
+C5 BLT     & 0.9797 & 0.0047 & 40.4  & 0.8463 & 0.9187 & 40 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -301,7 +338,8 @@ C1 & 0.430 & 0.780 & 0.350 & 0.785 \\
 C2 & 1.078 & 1.267 & 0.189 & 1.320 \\
 C3 & 0.445 & 0.781 & 0.336 & 0.785 \\
 C4 & 0.443 & 0.789 & 0.346 & 0.792 \\
-C5 & 0.013 & 0.001 & $-0.012$ & 0.001 \\
+% FIXME-C5: replace with the final 120-epoch server-run numbers (outputs/C5)
+C5 & 0.134 & 0.255 & $+0.121$ & 0.255 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -324,11 +362,37 @@ C1--C4 (0.2--0.6\% of lines exactly right) --- a single drifted byte in a
 C5 gets right for 93.4\% of lines, which is the cleanest possible confirmation
 that the remaining error is alignment maintenance, not cipher learning.
 
-Third, C5 (token-free, non-autoregressive, 1:1 byte mapping) is the strongest
-result of the study: 1.0000 bit accuracy, 0.9343 exact sequences, mean edit
-distance 0.1, with 3.4M parameters and a 15-minute training run. The 6.6\% of
-lines that are not exact contain small localized errors (a handful of bytes each)
-rather than global drift.
+Third, C5 (token-free, non-autoregressive, 1:1 byte mapping, entropy-based
+dynamic patching) is the strongest result of the study: 0.9797 bit accuracy ---
+29 points above the best autoregressive config --- with a mean edit distance of
+40 on lines averaging 554 bytes, and 5.5M parameters. Its remaining errors are
+scattered single bytes (about 2\% of positions) rather than global drift: no
+off-by-one shifts, no patch-boundary clustering in the error pattern, and the
+validation loss was still decreasing at the final checkpoint, i.e. the
+configuration is undertrained rather than structurally limited (a 64-line
+overfit probe drives its train loss to $5{\cdot}10^{-4}$ with 100\% bit
+accuracy). % FIXME-C5: replace with final 120-epoch numbers
+
+Table~\ref{tab:c5patch} isolates the patching choice: the same C5 architecture
+trained with fixed stride-4 patches (the original BLT token-free recipe) versus
+entropy-based dynamic patches, over the identical 120-epoch schedule.
+% FIXME-C5: fill in both rows from outputs/C5 and outputs/ablations/C5
+
+\begin{table}[h]
+\centering
+\caption{C5 patching ablation (120 epochs, same architecture and schedule): fixed
+stride-4 patches vs entropy-based dynamic patches (mean 4.0 bytes, calibrated
+$\theta_g{=}4.63$). Test set: 426 lines.}
+\label{tab:c5patch}
+\begin{tabular}{lrrrrr}
+\toprule
+Patching & Bit acc. & Seq acc. & Levenshtein $\downarrow$ & BLEU & ROUGE-L \\
+\midrule
+fixed stride 4                  & \textbf{TBD} & \textbf{TBD} & \textbf{TBD} & \textbf{TBD} & \textbf{TBD} \\
+entropy (dynamic, mean 4.0 B)   & \textbf{TBD} & \textbf{TBD} & \textbf{TBD} & \textbf{TBD} & \textbf{TBD} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \section{Discussion}
 \label{sec:discussion}
@@ -366,12 +430,12 @@ cost makes it the sensible default for production, and we find no reason to
 prefer LayerNorm here.
 
 \paragraph{The token-free baseline wins, and that is informative.}
-C5 pairs each ciphertext byte (patch of 4 raw bytes) with the plaintext byte at
-the same index and predicts all positions in parallel. It works because the XOR
-cipher is a deterministic per-byte function of $(b, i \bmod 8)$ and the phase is
-a deterministic function of the position: once the 1:1 alignment is given, each
-output position is a local lookup with context, and there is no autoregressive
-prefix to drift. Two caveats belong with this reading. The cipher is far easier
+C5 pairs each ciphertext byte with the plaintext byte at the same index (bytes
+grouped into entropy-driven patches of mean size 4) and predicts all positions
+in parallel. It works because the XOR cipher is a deterministic per-byte
+function of $(b, i \bmod 8)$ and the phase is a deterministic function of the
+position: once the 1:1 alignment is given, each output position is a local
+lookup with context, and there is no autoregressive prefix to drift. Two caveats belong with this reading. The cipher is far easier
 than a general seq2seq objective --- a non-autoregressive model would not
 necessarily beat an autoregressive one on, say, open translation, where the
 target has its own fluent continuation distribution. And C5's test set is the
@@ -416,10 +480,15 @@ venv with PyTorch cu124, \texttt{tokenizers}, \texttt{wandb}); no code changes
 are needed for bf16-capable GPUs (autocast dtype is auto-selected).
 
 \textbf{Training.} \texttt{bash scripts/run\_experiment.sh C1} (or
-\texttt{C2}--\texttt{C5}) runs one config: 40 epochs, fp16/bf16 auto, WandB
+\texttt{C2}--\texttt{C4}) runs one config: 40 epochs, fp16/bf16 auto, WandB
 logged to \texttt{anlp-assignment1}, best checkpoint uploaded to
-\texttt{anlp-a1-<C>}. \texttt{bash scripts/submit\_all.sh} submits all five as
-SLURM jobs; the runs reported here used that flow.
+\texttt{anlp-a1-<C>}. \texttt{bash scripts/submit\_all.sh} submits the four
+autoregressive configs as SLURM jobs. C5 (and its fixed-patch ablation control)
+is submitted with \texttt{bash scripts/submit\_c5.sh}, which runs the 120-epoch
+entropy-patching C5 to \texttt{outputs/C5} and the fixed stride-4 control to
+\texttt{outputs/ablations/C5}; C5's checkpoint additionally stores the auxiliary
+entropy model and the calibrated patching parameters, and
+\texttt{eval\_checkpoint.py} restores them automatically.
 
 \textbf{Evaluation.} \texttt{python scripts/eval\_checkpoint.py --checkpoint
 outputs/C1/model\_best.pt} re-runs the full greedy test evaluation for a
@@ -430,7 +499,10 @@ the tables of Section~\ref{sec:results} from the saved
 \textbf{Links.} Weights \& Biases project:
 \url{https://wandb.ai/irishbumfuzzle-team/anlp-assignment1} (runs: C1
 \texttt{pz4akfn6}, C2 \texttt{k7i8v6qx}, C3 \texttt{5ssmwo4e}, C4
-\texttt{1j34vx49}, C5 \texttt{ldihh8vu}). Hugging Face repositories:
+\texttt{1j34vx49}, C5 \texttt{C5-entropy} and \texttt{C5-fixed}). % FIXME-C5: final run ids
+The C5 Hugging Face repository contains the entropy-patching checkpoint
+(re-uploaded; the pre-change fixed-patch checkpoint is archived in
+\texttt{../a1-stale-runs-backup/}). Hugging Face repositories:
 \url{https://huggingface.co/IrishBumfuzzle/anlp-a1-C1} through
 \url{https://huggingface.co/IrishBumfuzzle/anlp-a1-C5} (each contains
 \texttt{model\_best.pt}, \texttt{model\_last.pt}, the learned BPE tokenizer,

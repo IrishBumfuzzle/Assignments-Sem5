@@ -333,56 +333,66 @@ class Seq2SeqTransformer(nn.Module):
 class BLTModel(nn.Module):
     """Byte Latent Transformer (config C5): token-free raw-byte processing.
 
-    raw cipher bytes -> LocalByteEncoder (patches) -> global transformer ->
-    LocalByteDecoder -> byte distributions.  The plain length equals the
-    cipher length byte-for-byte, so decoding is a single forward pass with no
-    autoregression.
+    raw cipher bytes -> LocalByteEncoder (dynamic patches) -> global transformer
+    over patch latents -> LocalByteDecoder -> per-byte distributions.  The
+    plain length equals the cipher length byte-for-byte, so decoding is a
+    single forward pass with no autoregression.
+
+    ``patching``: "entropy" (variable-size patches from entropy patching) or
+    "fixed" (stride-``patch_size`` ablation control).  The per-row patch
+    structure arrives with the batch (``patch_starts`` / ``patch_lens``).
     """
 
-    def __init__(self, cfg: TransformerConfig, patch_size: int = 4,
-                 byte_dim: int = 64, n_local_layers: int = 2,
-                 n_local_heads: int = 4):
+    def __init__(self, cfg: TransformerConfig, patching: str = "entropy",
+                 patch_size: int = 4, max_patch: int = 12, byte_dim: int = 64,
+                 n_local_layers: int = 2, n_local_heads: int = 4,
+                 local_window: int = 16, ngram_table: int = 4096):
         super().__init__()
         self.cfg = cfg
-        self.patch_size = patch_size
+        self.patching = patching
+        self.max_patch = max(max_patch, patch_size)
         self.local_encoder = LocalByteEncoder(
-            byte_dim=byte_dim, patch_size=patch_size, d_model=cfg.d_model,
+            byte_dim=byte_dim, d_model=cfg.d_model,
             n_local_layers=n_local_layers, n_local_heads=n_local_heads,
-            dropout=cfg.dropout, norm_layer=cfg.norm_layer(),
+            max_patch=self.max_patch, ngram_table=ngram_table,
+            window=local_window, dropout=cfg.dropout, norm_layer=cfg.norm_layer(),
         )
         # Global transformer over patch latents (no token embedding).
         self.global_encoder = TransformerEncoder(cfg)
         self.local_decoder = LocalByteDecoder(
-            byte_dim=byte_dim, patch_size=patch_size, d_model=cfg.d_model,
-            n_local_heads=n_local_heads, dropout=cfg.dropout,
+            byte_dim=byte_dim, d_model=cfg.d_model, max_patch=self.max_patch,
+            n_local_heads=n_local_heads, n_local_layers=1,
+            window=local_window, dropout=cfg.dropout,
             norm_layer=cfg.norm_layer(),
         )
 
-    def forward(self, byte_ids: torch.Tensor, byte_mask: torch.Tensor) -> torch.Tensor:
-        """byte_ids: (B, L) values 0..255 + BYTE_PAD; byte_mask: (B, L) True=real.
+    def forward(self, byte_ids: torch.Tensor, patch_starts: torch.Tensor,
+                patch_lens: torch.Tensor) -> torch.Tensor:
+        """byte_ids: (B, L) values 0..255 + BYTE_PAD.
+        patch_starts/patch_lens: (B, Np) per-row patch structure.
 
-        Returns byte logits (B, L', 256) where L' = ceil(L/patch_size)*patch_size.
+        Returns byte logits (B, L, 256), aligned 1:1 to the source bytes.
         """
-        latents, patch_mask = self.local_encoder(byte_ids)
+        latents, patch_mask, pid, h_last = self.local_encoder(
+            byte_ids, patch_starts, patch_lens)
         memory = self.global_encoder(latents, mask=patch_mask, repr_input=True)
-        return self.local_decoder(memory)
+        byte_mask = byte_ids != BYTE_PAD
+        return self.local_decoder(memory, h_last, byte_mask, pid, patch_starts)
 
     @torch.no_grad()
-    def predict_bytes(self, byte_ids: torch.Tensor, lengths: torch.Tensor) -> List[list]:
+    def predict_bytes(self, byte_ids: torch.Tensor, patch_starts: torch.Tensor,
+                      patch_lens: torch.Tensor, lengths: torch.Tensor) -> List[list]:
         """Greedy single-pass decode.  Returns per-sample predicted byte lists
         of exactly the requested (ground-truth) lengths."""
         self.eval()
-        L = byte_ids.size(1)
-        arange = torch.arange(L, device=byte_ids.device)
-        mask = arange[None, :] < lengths[:, None]
         if byte_ids.is_cuda:
             major, minor = torch.cuda.get_device_capability(byte_ids.device.index)
             # bf16 on Ampere+, fp16 on older GPUs (e.g. 2080 Ti).
             amp_dtype = torch.bfloat16 if major * 10 + minor >= 80 else torch.float16
             with torch.autocast("cuda", dtype=amp_dtype):
-                logits = self.forward(byte_ids, mask)
+                logits = self.forward(byte_ids, patch_starts, patch_lens)
         else:
-            logits = self.forward(byte_ids, mask)
-        pred = logits.argmax(dim=-1)  # (B, L')
+            logits = self.forward(byte_ids, patch_starts, patch_lens)
+        pred = logits.argmax(dim=-1)  # (B, L)
         return [pred[i, : int(lengths[i].item())].cpu().tolist()
                 for i in range(byte_ids.size(0))]

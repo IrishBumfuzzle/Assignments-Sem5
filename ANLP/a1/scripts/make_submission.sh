@@ -14,7 +14,7 @@ STAGE="/tmp/${ROLL}_assignment1"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/src" "$STAGE/scripts" "$STAGE/outputs" "$STAGE/report"
 
-cp -r src/models src/dataset.py src/train.py src/utils.py "$STAGE/src/"
+cp -r src/models src/dataset.py src/train.py src/utils.py src/entropy_patching.py "$STAGE/src/"
 cp scripts/*.sh scripts/*.py "$STAGE/scripts/" 2>/dev/null || true
 
 for C in C1 C2 C3 C4 C5; do
@@ -26,6 +26,12 @@ for C in C1 C2 C3 C4 C5; do
     echo "warning: outputs/$C missing"
   fi
 done
+
+# C5 fixed-patch ablation control (outputs/ablations/C5)
+if [ -d "outputs/ablations/C5" ]; then
+  mkdir -p "$STAGE/outputs/ablations/C5"
+  find "outputs/ablations/C5" -type f ! -name "*.pt" -exec cp --parents {} "$STAGE/" \;
+fi
 
 cp README.md "$STAGE/" 2>/dev/null || true
 cp IMPLEMENTATION.md "$STAGE/" 2>/dev/null || true

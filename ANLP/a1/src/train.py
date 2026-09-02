@@ -36,9 +36,19 @@ from dataset import (
     BPETextTokenizer,
     PhaseByteBPE,
     cipher_bitstring_to_byte_str,
+    cipher_bytes_of,
     collate_byte_target,
     load_pairs,
     make_dataloaders,
+)
+from entropy_patching import (
+    EntropyLMConfig,
+    build_patch_structures,
+    calibrate_theta_g,
+    next_byte_entropies,
+    patch_stats,
+    train_entropy_lm,
+    verify_incremental,
 )
 from models.transformer import BLTModel, Seq2SeqTransformer, TransformerConfig
 from utils import compute_metrics, plot_training_curves
@@ -133,6 +143,35 @@ def parse_args():
     p.add_argument("--byte-dim", type=int, default=64)
     p.add_argument("--local-layers", type=int, default=2)
     p.add_argument("--local-heads", type=int, default=4)
+    p.add_argument("--patching", choices=["entropy", "fixed"], default="entropy",
+                   help="C5 patching scheme: entropy = entropy-based dynamic "
+                        "patching (default), fixed = stride --patch-size "
+                        "(ablation control)")
+    p.add_argument("--max-patch", type=int, default=12,
+                   help="C5 entropy patching: hard cap on patch size in bytes")
+    p.add_argument("--target-patch-size", type=float, default=4.0,
+                   help="C5 entropy patching: mean patch size (in bytes) that "
+                        "the global threshold is calibrated to hit on the "
+                        "training data")
+    p.add_argument("--theta-r", type=float, default=1.0,
+                   help="C5 entropy patching: approx-monotonicity threshold "
+                        "(new patch also when H(x_t) - H(x_{t-1}) > theta_r). "
+                        "Calibrated on this data: <=0.75 makes relative "
+                        "triggers too dense to reach a 4-byte mean patch")
+    p.add_argument("--local-window", type=int, default=16,
+                   help="C5: local causal window in bytes for the byte-level "
+                        "transformer layers (should be >= max patch size)")
+    p.add_argument("--ngram-table", type=int, default=4096,
+                   help="C5: hash table size for the byte n-gram hash "
+                        "embeddings")
+    p.add_argument("--entropy-epochs", type=int, default=40,
+                   help="C5: epochs for training the small entropy model")
+    p.add_argument("--entropy-dim", type=int, default=128)
+    p.add_argument("--entropy-layers", type=int, default=2)
+    p.add_argument("--entropy-heads", type=int, default=4)
+    p.add_argument("--entropy-ffn", type=int, default=256)
+    p.add_argument("--entropy-window", type=int, default=256,
+                   help="C5: sliding-window context (bytes) of the entropy model")
     # logging / checkpoints
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--run-name", type=str, default=None,
@@ -256,8 +295,13 @@ def build_model(args, spec: dict, device: torch.device, src_vocab: int = None,
         prefix_dropout=getattr(args, "prefix_dropout", 0.0),
     )
     if spec["tokenization"] == "blt":
-        model = BLTModel(tcfg, patch_size=args.patch_size, byte_dim=args.byte_dim,
-                         n_local_layers=args.local_layers, n_local_heads=args.local_heads)
+        model = BLTModel(tcfg, patching=getattr(args, "patching", "entropy"),
+                         patch_size=args.patch_size,
+                         max_patch=max(getattr(args, "max_patch", 12), args.patch_size),
+                         byte_dim=args.byte_dim,
+                         n_local_layers=args.local_layers, n_local_heads=args.local_heads,
+                         local_window=getattr(args, "local_window", 16),
+                         ngram_table=getattr(args, "ngram_table", 4096))
     elif use_bytes_target:
         model = Seq2SeqTransformer(src_vocab, tgt_vocab, tcfg,
                                    pad_idx=PAD_ID, eos_idx=BYTE_EOS,
@@ -272,8 +316,8 @@ def train_step(model, batch, criterion, device, is_blt: bool,
                dec_input: torch.Tensor = None):
     if is_blt:
         src, tgt = batch["src"].to(device), batch["tgt"].to(device)
-        mask = batch["src_mask"].to(device)
-        logits = model(src, mask)
+        logits = model(src, batch["patch_starts"].to(device),
+                       batch["patch_lens"].to(device))
         logits = logits[:, : tgt.size(1)]  # align to padded byte length
         return criterion(logits.reshape(-1, 256), tgt.reshape(-1))
     src, tgt = batch["src"].to(device), batch["tgt"].to(device)
@@ -366,7 +410,9 @@ def evaluate(model, loader, device, args, is_blt: bool, plain_tok=None, amp=None
         if is_blt:
             lengths = batch["lengths"].to(device)
             with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_enabled):
-                byte_lists = model.predict_bytes(src, lengths)
+                byte_lists = model.predict_bytes(
+                    src, batch["patch_starts"].to(device),
+                    batch["patch_lens"].to(device), lengths)
             preds.extend([bytes(b).decode("latin1") for b in byte_lists])
         else:
             src_mask = batch["src_mask"].to(device)
@@ -425,14 +471,43 @@ def log_samples(wandb_run, metrics: dict, step_name: str):
     })
 
 
-def save_checkpoint(path, model, tcfg, args, epoch, metrics):
-    torch.save({
+def _log_patch_stats(wandb_run, patch_info: dict):
+    """Log C5 entropy-patching hyperparameters and patch-size distributions."""
+    try:
+        import wandb
+    except ImportError:
+        return
+    log = {"c5/theta_g": patch_info.get("theta_g"),
+           "c5/theta_r": patch_info.get("theta_r"),
+           "c5/max_patch": patch_info.get("max_patch"),
+           "c5/target_patch_size": patch_info.get("target_patch_size")}
+    for split in ("train", "val", "test"):
+        st = patch_info.get("stats", {}).get(split, {})
+        for k in ("mean_patch_size", "median_patch_size", "min_patch_size",
+                  "max_patch_size", "std_patch_size", "single_byte_patch_frac",
+                  "n_patches", "n_bytes"):
+            if k in st:
+                log[f"c5/{split}_{k}"] = st[k]
+        counts, centers = st.get("hist_counts"), st.get("hist_centers")
+        if counts and centers:
+            c = np.array(centers, dtype=np.float64)
+            edges = np.concatenate([c[:1] - 0.5, c, c[-1:] + 0.5])
+            log[f"c5/{split}_patch_size_hist"] = wandb.Histogram(
+                np_histogram=(np.array(counts, dtype=np.float64), edges))
+    wandb_run.log(log)
+
+
+def save_checkpoint(path, model, tcfg, args, epoch, metrics, extra=None):
+    state = {
         "model": model.state_dict(),
         "tcfg": asdict(tcfg),
         "args": vars(args),
         "epoch": epoch,
         "metrics": {k: v for k, v in metrics.items() if not k.startswith("_")},
-    }, path)
+    }
+    if extra:
+        state.update(extra)
+    torch.save(state, path)
 
 
 def upload_to_hf(args, output_dir: str) -> str:
@@ -538,6 +613,75 @@ def main():
             args.max_tgt_len = min(args.max_tgt_len, 800)
         print(f"[data] byte targets: max_tgt_len set to {args.max_tgt_len}")
 
+    # ---------------- C5: entropy-based dynamic patching ----------------
+    patch_structures = None
+    patch_info = {}
+    entropy_lm_state = None
+    if is_blt:
+        t0 = time.time()
+
+        def _kept_bytes(pairs_list):
+            # same line filter + order as ByteCipherDataset
+            out = []
+            for c, _ in pairs_list:
+                cb = cipher_bytes_of(c)
+                if len(cb) <= args.max_src_len:
+                    out.append(list(cb))
+            return out
+
+        kept = {name: _kept_bytes(split[name]) for name in ("train", "val", "test")}
+        if args.patching == "fixed":
+            patch_info = {"method": "fixed", "patch_size": args.patch_size}
+            print(f"[c5] patching: fixed stride {args.patch_size} "
+                  f"(structures built in the dataset)")
+        else:
+            assert verify_incremental(), "incremental-patching self-test failed"
+            elmcfg = EntropyLMConfig(
+                d_model=args.entropy_dim, n_heads=args.entropy_heads,
+                n_layers=args.entropy_layers, d_ff=args.entropy_ffn,
+                window=args.entropy_window,
+                max_len=max(len(x) for x in kept["train"]) + 1)
+            n_ent_bytes = sum(len(x) for x in kept["train"]) / 1e6
+            print(f"[c5] training entropy model on {len(kept['train'])} train lines "
+                  f"({n_ent_bytes:.2f}M bytes)...")
+            lm = train_entropy_lm(kept["train"], elmcfg,
+                                  epochs=args.entropy_epochs, device=device,
+                                  seed=args.seed + 1000)
+            print(f"[c5] entropy model done in {time.time() - t0:.0f}s; "
+                  f"computing next-byte entropies...")
+            Hs = {name: next_byte_entropies(lm, kept[name], device)
+                  for name in ("train", "val", "test")}
+            theta_g = calibrate_theta_g(Hs["train"], args.theta_r, args.max_patch,
+                                        args.target_patch_size)
+            patch_structures = {
+                name: build_patch_structures(kept[name], theta_g, args.theta_r,
+                                             args.max_patch, Hs[name])
+                for name in ("train", "val", "test")}
+            stats = {name: patch_stats([len(x) for x in kept[name]],
+                                       patch_structures[name])
+                     for name in ("train", "val", "test")}
+            with open(os.path.join(output_dir, "entropy_model.pt"), "wb") as f:
+                torch.save({"state": lm.state_dict(), "cfg": asdict(elmcfg)}, f)
+            entropy_lm_state = lm.state_dict()
+            patch_info = {
+                "method": "entropy",
+                "theta_g": float(theta_g),
+                "theta_r": args.theta_r,
+                "max_patch": args.max_patch,
+                "target_patch_size": args.target_patch_size,
+                "stats": stats,
+                "entropy_lm_cfg": asdict(elmcfg),
+            }
+            for name in ("train", "val", "test"):
+                st = stats[name]
+                print(f"[c5] patching {name:5s}: mean {st['mean_patch_size']:.2f} "
+                      f"| median {st['median_patch_size']:.0f} | "
+                      f"[{st['min_patch_size']},{st['max_patch_size']}] bytes | "
+                      f"1-byte {100 * st['single_byte_patch_frac']:.1f}% | "
+                      f"{st['n_patches']} patches")
+            print(f"[c5] entropy patching ready (theta_g={theta_g:.4f}) in "
+                  f"{time.time() - t0:.0f}s")
+
     tokenizers = None
     plain_tok = None
     phase_alphabet = use_bytes_target and not args.no_phase_alphabet
@@ -551,7 +695,9 @@ def main():
         print(f"[bpe] trained/loaded tokenizers in {time.time() - t0:.1f}s "
               f"(cipher vocab={cipher_tok.vocab_size}, plain vocab={plain_tok.vocab_size})")
 
-    loaders = make_dataloaders(split, args, tokenizers, target_bytes=use_bytes_target)
+    loaders = make_dataloaders(split, args, tokenizers,
+                               target_bytes=use_bytes_target,
+                               patch_structures=patch_structures)
     for name in ("train", "val", "test"):
         print(f"[data] {name}: {len(loaders[name].dataset)} samples")
 
@@ -572,7 +718,9 @@ def main():
             print("[target] BPE subword; cipher BPE over raw cipher bytes")
     with open(os.path.join(output_dir, "config.json"), "w") as f:
         json.dump({"config": args.config, "spec": spec, "tcfg": asdict(tcfg),
-                   "n_params": n_params, "args": vars(args)}, f, indent=2, default=str)
+                   "n_params": n_params, "args": vars(args),
+                   "patching": patch_info if is_blt else None},
+                  f, indent=2, default=str)
 
     criterion = nn.CrossEntropyLoss(
         ignore_index=BYTE_PAD if (is_blt or use_bytes_target) else PAD_ID)
@@ -633,6 +781,8 @@ def main():
                         )
                     except Exception as e:
                         print(f"[wandb] offline init failed too: {e} - continuing without wandb")
+    if wandb_run is not None and is_blt and patch_info.get("method") == "entropy":
+        _log_patch_stats(wandb_run, patch_info)
 
     # ---------------- training loop ----------------
     history = {k: [] for k in ("epoch", "train_loss", "val_loss", "val_bit_accuracy",
@@ -641,6 +791,15 @@ def main():
     best_val = (float("inf"), 0.0)  # (loss, seq_acc)
     global_step = 0
     t_start = time.time()
+
+    # C5: checkpoint extra = patching config (+ entropy model state, so that
+    # re-evaluation can reproduce the exact dynamic patch structures).
+    blt_extra = None
+    if is_blt:
+        blt_extra = {"patching": patch_info}
+        if patch_info.get("method") == "entropy" and entropy_lm_state is not None:
+            blt_extra["entropy_lm"] = {"state": entropy_lm_state,
+                                       "cfg": patch_info["entropy_lm_cfg"]}
 
     # ---------------- scheduled sampling setup (C1-C4 byte targets) --------
     use_ss = bool(getattr(args, "scheduled_sampling", False)) and use_bytes_target
@@ -789,9 +948,9 @@ def main():
         if improved:
             best_val = (val_loss, val_metrics["sequence_accuracy"])
             save_checkpoint(os.path.join(output_dir, "model_best.pt"), model, tcfg,
-                            args, epoch, val_metrics)
+                            args, epoch, val_metrics, extra=blt_extra)
         save_checkpoint(os.path.join(output_dir, "model_last.pt"), model, tcfg,
-                        args, epoch, val_metrics)
+                        args, epoch, val_metrics, extra=blt_extra)
 
         if wandb_run is not None:
             wandb_run.log({
@@ -828,6 +987,7 @@ def main():
     results = {
         "config": args.config,
         "spec": spec,
+        "patching": patch_info if is_blt else None,
         "n_params": n_params,
         "train_samples": len(loaders["train"].dataset),
         "val_samples": len(loaders["val"].dataset),
